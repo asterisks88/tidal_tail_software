@@ -13,10 +13,11 @@ import h5py
 import numpy as np
 import pyvista as pv
 from astropy.convolution import Gaussian2DKernel, convolve
-from astropy.cosmology import FlatLambdaCDM, Planck18
+from astropy.cosmology import Planck18
 from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.wcs.utils import proj_plane_pixel_scales
+from scipy import ndimage
 from vtkmodules.vtkInteractionWidgets import (
     vtkDistanceRepresentation3D,
     vtkDistanceWidget,
@@ -226,7 +227,6 @@ def read_brick_wcs_shape(brick_file: Path, brick_hdu: int = 1):
 
 def make_host_centered_wcs_header(
     *,
-    brick_wcs: WCS,
     brick_hdr: fits.Header,
     host_image_size: tuple[int, int],  # (W, H)
     host_ra_deg: float,
@@ -421,298 +421,6 @@ def _counts_from_masses(
     return counts
 
 
-def _host_core_centroid(
-    px,
-    py,
-    counts,
-    galaxy_id,
-    width,
-    height,
-    pixel_scale_arcsec,
-    psf_fwhm_arcsec=0.0,
-    core_radius_pix=40,
-):
-    sel = (
-        (galaxy_id == 0)
-        & np.isfinite(px)
-        & np.isfinite(py)
-        & np.isfinite(counts)
-        & (counts > 0)
-    )
-    if np.count_nonzero(sel) < 10:
-        return None
-
-    # Bin host light into an image using pixel-center conventions
-    img = np.histogram2d(
-        py[sel],
-        px[sel],
-        bins=[height, width],
-        range=[[-0.5, height - 0.5], [-0.5, width - 0.5]],
-        weights=counts[sel],
-    )[0].astype(np.float64)
-
-    if psf_fwhm_arcsec and psf_fwhm_arcsec > 0:
-        sigma_pix = (float(psf_fwhm_arcsec) / float(pixel_scale_arcsec)) / (
-            2.0 * np.sqrt(2.0 * np.log(2.0))
-        )
-        img = convolve(
-            img,
-            Gaussian2DKernel(sigma_pix),
-            boundary="extend",
-            normalize_kernel=True,
-        )
-
-    y_peak, x_peak = np.unravel_index(np.nanargmax(img), img.shape)
-
-    yy, xx = np.indices(img.shape)
-    r2 = (xx - x_peak) ** 2 + (yy - y_peak) ** 2
-    w = np.where(r2 <= core_radius_pix**2, img, 0.0)
-
-    sw = np.sum(w)
-    if sw <= 0:
-        return float(x_peak), float(y_peak)
-
-    cx = float(np.sum(xx * w) / sw)
-    cy = float(np.sum(yy * w) / sw)
-    return cx, cy
-
-
-def compute_surface_brightness_image(
-    particles,
-    counts,
-    galaxy_id,
-    camera,
-    image_size,
-    zp,
-    redshift,
-    cosmo,
-    pixel_scale_arcsec,
-    psf_fwhm_arcsec,
-    noise_std,
-    output_magnitude=False,
-    host_target_xy=None,
-    sat_target_xy=None,
-    masses=None,
-    tail_bbox=None,
-    m_sat_total_overall=None,
-    m_host_total_overall=None,
-):
-    """
-    particles: (N,3) kpc
-    counts:    (N,) nanomaggies per particle (already includes M/L and distance modulus)
-    galaxy_id: (N,) with 0=host, 1=sat (required for 2-anchor alignment)
-    image_size: (width, height) in pixels (should match brick)
-    host_target_xy / sat_target_xy: target pixels in brick coordinates (0-based floats)
-
-    Returns:
-      img, pixel_scale_arcsec
-    """
-
-    width, height = image_size
-    da = cosmo.angular_diameter_distance(redshift).to(u.kpc).value  # kpc
-
-    # Camera basis
-    cam_pos = np.array(camera.GetPosition(), dtype=np.float64)
-    focal = np.array(camera.GetFocalPoint(), dtype=np.float64)
-    view_up = np.array(camera.GetViewUp(), dtype=np.float64)
-
-    forward = focal - cam_pos
-    forward /= np.linalg.norm(forward) + 1e-30
-
-    # Make "up" be the camera's up direction, orthogonalized to forward
-    up = view_up - np.dot(view_up, forward) * forward
-    up /= np.linalg.norm(up) + 1e-30
-
-    # Right-handed screen basis
-    right = np.cross(forward, up)
-    right /= np.linalg.norm(right) + 1e-30
-
-    # FOV derived from pixel scale (independent axes; critical for non-square images)
-    hfov_deg = width * float(pixel_scale_arcsec) / ARCSEC_IN_DEG
-    vfov_deg = height * float(pixel_scale_arcsec) / ARCSEC_IN_DEG
-    hfov_rad = np.deg2rad(hfov_deg)
-    vfov_rad = np.deg2rad(vfov_deg)
-
-    # Project particles
-    delta = particles - focal
-    parallel_comp = np.dot(delta, forward)[:, None] * forward[None, :]
-    transverse = delta - parallel_comp
-
-    x_phys = np.dot(transverse, right)
-    y_phys = np.dot(transverse, up)
-
-    angle_x = x_phys / da
-    angle_y = y_phys / da
-
-    cx = (width - 1) / 2.0
-    cy = (height - 1) / 2.0
-    sx = (width - 1) / 2.0
-    sy = (height - 1) / 2.0
-    px = cx + (angle_x / (hfov_rad / 2.0)) * sx
-    py = cy + (angle_y / (vfov_rad / 2.0)) * sy
-
-    valid = (
-        (px >= -0.5)
-        & (px < width - 0.5)
-        & (py >= -0.5)
-        & (py < height - 0.5)
-        & np.isfinite(px)
-        & np.isfinite(py)
-        & np.isfinite(counts)
-    )
-    # px = (angle_x / (hfov_rad / 2.0)) * (width / 2.0) + (width / 2.0)
-    # py = (angle_y / (vfov_rad / 2.0)) * (height / 2.0) + (height / 2.0)
-
-    #    valid = (
-    #        (px >= 0)
-    #        & (px < width)
-    #        & (py >= 0)
-    #        & (py < height)
-    #        & np.isfinite(px)
-    #        & np.isfinite(py)
-    #        & np.isfinite(counts)
-    #    )
-    if not np.any(valid):
-        raise RuntimeError("No particles project inside the field of view.")
-
-    # --- Alignment in pixel space ---
-    # If both anchors are available, do a 2-anchor similarity transform (with optional flips).
-    # Otherwise, if only host_target_xy is available, do a host-only translation to center host.
-    if (host_target_xy is not None) and (galaxy_id is not None):
-        gid = np.asarray(galaxy_id, dtype=np.int16)
-
-        # def _weighted_centroid(sel):
-        #    sel = sel & valid & (counts > 0)
-        print(f"COUNTS {counts}")
-
-        def _weighted_centroid(sel):
-            sel = (
-                sel
-                & np.isfinite(px)
-                & np.isfinite(py)
-                & np.isfinite(counts)
-                & (counts > 0)
-            )
-
-            if np.count_nonzero(sel) < 10:
-                print("NOT ENOUGH")
-                return None
-
-            w = counts[sel]
-            sw = np.sum(w)
-            if sw <= 0:
-                print("SW < 0")
-                return None
-            cx = float(np.sum(px[sel] * w) / sw)
-            cy = float(np.sum(py[sel] * w) / sw)
-            return cx, cy
-
-        host_c = _host_core_centroid(
-            px=px,
-            py=py,
-            counts=counts,
-            galaxy_id=gid,
-            width=width,
-            height=height,
-            pixel_scale_arcsec=pixel_scale_arcsec,
-            psf_fwhm_arcsec=psf_fwhm_arcsec,
-            core_radius_pix=40,
-        )
-        # host_c = _weighted_centroid(gid == 0)
-        # sat_c = _weighted_centroid(gid == 1) if (sat_target_xy is not None) else None
-        if host_c is not None:
-            hx, hy = host_c
-            hb_x, hb_y = map(float, host_target_xy)
-            print(f"Doing host translation {hx} {hy} to {hb_x, hb_y}")
-
-            px = px + (hb_x - hx)
-            py = py + (hb_y - hy)
-            sel = (
-                (gid == 0)
-                & np.isfinite(px)
-                & np.isfinite(py)
-                & np.isfinite(counts)
-                & (counts > 0)
-            )
-            w = counts[sel]
-            hx2 = float(np.sum(px[sel] * w) / np.sum(w))
-            hy2 = float(np.sum(py[sel] * w) / np.sum(w))
-            print(
-                f"post-translation host centroid = ({hx2:.3f}, {hy2:.3f}), "
-                f"target = ({hb_x:.3f}, {hb_y:.3f})"
-            )
-            valid = (
-                (px >= 0)
-                & (px < width)
-                & (py >= 0)
-                & (py < height)
-                & np.isfinite(px)
-                & np.isfinite(py)
-                & np.isfinite(counts)
-            )
-    tail_report = None
-    if (tail_bbox is not None) and (masses is not None):
-        masses = np.asarray(masses, dtype=np.float64)
-        if masses.shape[0] != counts.shape[0]:
-            raise RuntimeError(
-                "masses and counts must have same length for tail report."
-            )
-        tail_report = _tail_bbox_report(
-            px=px,
-            py=py,
-            valid=valid,
-            counts=counts,
-            masses=masses,
-            galaxy_id=galaxy_id,
-            bbox=tail_bbox,
-            width=width,
-            height=height,
-            m_sat_total_overall=m_sat_total_overall,
-            m_host_total_overall=m_host_total_overall,
-        )
-
-    # Histogram to image (nanomaggies/pixel if output_magnitude=False)
-    H = np.histogram2d(
-        py[valid],
-        px[valid],
-        bins=[height, width],
-        range=[[-0.5, height - 0.5], [-0.5, width - 0.5]],
-        weights=counts[valid],
-    )[0].astype(np.float64)
-    #    H = np.histogram2d(
-    #        py[valid],
-    #        px[valid],
-    #        bins=[height, width],
-    #        range=[[0, height], [0, width]],
-    #        weights=counts[valid],
-    #    )[0].astype(np.float64)
-    img = H  # nanomaggies/pixel
-
-    # Add Gaussian noise (assumed same units as img)
-    if noise_std and noise_std > 0:
-        img = img + np.random.normal(0.0, float(noise_std), size=img.shape)
-
-    # PSF convolution (Gaussian)
-    if psf_fwhm_arcsec and psf_fwhm_arcsec > 0:
-        sigma_pix = (float(psf_fwhm_arcsec) / float(pixel_scale_arcsec)) / (
-            2.0 * np.sqrt(2.0 * np.log(2.0))
-        )
-        kernel = Gaussian2DKernel(sigma_pix)
-        img = convolve(img, kernel, boundary="extend", normalize_kernel=True)
-
-    if output_magnitude:
-        # Convert to mag/arcsec^2 using pixel area
-        pixel_area_arcsec2 = float(pixel_scale_arcsec) ** 2
-        intensity_arcsec2 = img / pixel_area_arcsec2
-        with np.errstate(divide="ignore", invalid="ignore"):
-            mu = zp - 2.5 * np.log10(intensity_arcsec2)
-        mu[~np.isfinite(mu)] = 35.0
-        mu += 10.0 * np.log10(1.0 + redshift)  # dimming
-        img = mu
-
-    return img, float(pixel_scale_arcsec), tail_report
-
-
 # ----------------------------
 # Event handlers
 # ----------------------------
@@ -850,6 +558,532 @@ def _tail_bbox_report(
     return out
 
 
+def _project_particles_to_pixel_offsets(
+    particles,
+    camera,
+    redshift,
+    cosmo,
+    pixel_scale_arcsec,
+):
+    """
+    Project 3D particle positions to 2D pixel offsets on a common native pixel grid.
+
+    Returns
+    -------
+    px, py : arrays
+        Pixel offsets in a camera-centered coordinate system. These are NOT tied
+        to any particular output image size or footprint.
+    """
+    da = cosmo.angular_diameter_distance(redshift).to(u.kpc).value  # kpc
+
+    cam_pos = np.array(camera.GetPosition(), dtype=np.float64)
+    focal = np.array(camera.GetFocalPoint(), dtype=np.float64)
+    view_up = np.array(camera.GetViewUp(), dtype=np.float64)
+
+    forward = focal - cam_pos
+    forward /= np.linalg.norm(forward) + 1e-30
+
+    up = view_up - np.dot(view_up, forward) * forward
+    up /= np.linalg.norm(up) + 1e-30
+
+    right = np.cross(forward, up)
+    right /= np.linalg.norm(right) + 1e-30
+
+    delta = particles - focal
+    parallel_comp = np.dot(delta, forward)[:, None] * forward[None, :]
+    transverse = delta - parallel_comp
+
+    x_phys = np.dot(transverse, right)
+    y_phys = np.dot(transverse, up)
+
+    # small-angle projection
+    angle_x = x_phys / da
+    angle_y = y_phys / da
+
+    pixscale_rad = np.deg2rad(float(pixel_scale_arcsec) / ARCSEC_IN_DEG)
+
+    px = angle_x / pixscale_rad
+    py = angle_y / pixscale_rad
+    return np.asarray(px, dtype=np.float64), np.asarray(py, dtype=np.float64)
+
+
+def _host_core_centroid_unbounded(
+    px,
+    py,
+    counts,
+    galaxy_id,
+    pixel_scale_arcsec,
+    psf_fwhm_arcsec=0.0,
+    core_radius_pix=40,
+):
+    """
+    Estimate the host-core centroid from projected host light WITHOUT clipping
+    to any output image footprint.
+
+    Robust against a small number of far-out host particles: it first finds a
+    robust central location, then builds only a bounded local postage stamp
+    around that central region.
+    """
+    sel = (
+        (galaxy_id == 0)
+        & np.isfinite(px)
+        & np.isfinite(py)
+        & np.isfinite(counts)
+        & (counts > 0)
+    )
+    if np.count_nonzero(sel) < 10:
+        return None
+
+    x = np.asarray(px[sel], dtype=np.float64)
+    y = np.asarray(py[sel], dtype=np.float64)
+    w = np.asarray(counts[sel], dtype=np.float64)
+
+    if x.size < 10:
+        return None
+
+    sigma_pix = 0.0
+    if psf_fwhm_arcsec and psf_fwhm_arcsec > 0:
+        sigma_pix = (float(psf_fwhm_arcsec) / float(pixel_scale_arcsec)) / (
+            2.0 * np.sqrt(2.0 * np.log(2.0))
+        )
+
+    # ------------------------------------------------------------------
+    # Step 1: robust center guess from medians, not min/max
+    # ------------------------------------------------------------------
+    x_med = float(np.median(x))
+    y_med = float(np.median(y))
+
+    r = np.hypot(x - x_med, y - y_med)
+
+    # Use only the inner part of the host distribution to define a local stamp.
+    # This avoids runaway memory use from a few distant particles.
+    r_q40 = float(np.percentile(r, 40.0))
+    r_q60 = float(np.percentile(r, 60.0))
+
+    # Local stamp half-size in pixels.
+    # Needs to be comfortably larger than the core aperture and PSF, but bounded.
+    local_half_size = max(
+        6.0 * float(core_radius_pix),
+        6.0 * sigma_pix,
+        r_q40,
+        64.0,
+    )
+
+    # Hard upper cap to prevent pathological allocations from rare outliers.
+    # This does NOT affect the final rendered image; it only affects centroid finding.
+    local_half_size = min(local_half_size, 1024.0)
+
+    keep = r <= max(local_half_size, r_q60)
+    if np.count_nonzero(keep) < 25:
+        # Fallback: keep the nearest particles to the median center
+        order = np.argsort(r)
+        nkeep = min(max(25, x.size // 20), x.size)
+        keep_idx = order[:nkeep]
+        xk = x[keep_idx]
+        yk = y[keep_idx]
+        wk = w[keep_idx]
+    else:
+        xk = x[keep]
+        yk = y[keep]
+        wk = w[keep]
+
+    # Recompute a local robust center from the kept set
+    x0 = float(np.median(xk))
+    y0 = float(np.median(yk))
+
+    margin = max(core_radius_pix + 4.0 * sigma_pix + 4.0, 8.0)
+    half = int(np.ceil(local_half_size + margin))
+
+    xmin = int(np.floor(x0)) - half
+    xmax = int(np.floor(x0)) + half
+    ymin = int(np.floor(y0)) - half
+    ymax = int(np.floor(y0)) + half
+
+    nx = xmax - xmin + 1
+    ny = ymax - ymin + 1
+    if nx <= 0 or ny <= 0:
+        return None
+
+    # Extra sanity cap
+    if nx > 4096 or ny > 4096:
+        raise RuntimeError(
+            f"Refusing to build oversized centroid stamp: nx={nx}, ny={ny}"
+        )
+
+    x_local = xk - xmin
+    y_local = yk - ymin
+
+    img = np.histogram2d(
+        y_local,
+        x_local,
+        bins=[ny, nx],
+        range=[[-0.5, ny - 0.5], [-0.5, nx - 0.5]],
+        weights=wk,
+    )[0].astype(np.float64)
+
+    if sigma_pix > 0:
+        img = convolve(
+            img,
+            Gaussian2DKernel(sigma_pix),
+            boundary="fill",
+            fill_value=0.0,
+            normalize_kernel=True,
+        )
+
+    if not np.any(np.isfinite(img)) or np.nanmax(img) <= 0:
+        return x0, y0
+
+    y_peak_local, x_peak_local = np.unravel_index(np.nanargmax(img), img.shape)
+
+    yy, xx = np.indices(img.shape)
+    r2 = (xx - x_peak_local) ** 2 + (yy - y_peak_local) ** 2
+    core = np.where(r2 <= core_radius_pix**2, img, 0.0)
+
+    sw = np.sum(core)
+    if sw <= 0:
+        return float(x_peak_local + xmin), float(y_peak_local + ymin)
+
+    cx = float(np.sum((xx + xmin) * core) / sw)
+    cy = float(np.sum((yy + ymin) * core) / sw)
+    return cx, cy
+
+
+def _output_window_edges(image_size, host_xy):
+    """
+    Return pixel-edge bounds in a host-relative coordinate system, where the host
+    centroid is at (0,0) in pixel-center coordinates.
+
+    For an output image of width W with host at pixel x=host_xy[0], the output
+    pixel centers correspond to x_rel = i - host_xy[0], i=0..W-1.
+    Therefore the pixel-edge range is:
+        [-host_xy[0]-0.5, W-host_xy[0]-0.5)
+    """
+    width, height = map(int, image_size)
+    hx, hy = map(float, host_xy)
+
+    x0 = -hx - 0.5
+    x1 = x0 + width
+    y0 = -hy - 0.5
+    y1 = y0 + height
+    return x0, x1, y0, y1
+
+
+def _nmgy_to_mu_image(img_nmgy, zp, pixel_scale_arcsec, redshift):
+    """
+    Convert nanomaggies/pixel -> mag/arcsec^2.
+    """
+    pixel_area_arcsec2 = float(pixel_scale_arcsec) ** 2
+    intensity_arcsec2 = img_nmgy / pixel_area_arcsec2
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mu = float(zp) - 2.5 * np.log10(intensity_arcsec2)
+
+    mu[~np.isfinite(mu)] = 35.0
+    mu += 10.0 * np.log10(1.0 + float(redshift))
+    return mu.astype(np.float64)
+
+
+def _build_common_master_image(
+    particles,
+    counts,
+    galaxy_id,
+    camera,
+    pixel_scale_arcsec,
+    redshift,
+    cosmo,
+    psf_fwhm_arcsec,
+    noise_std,
+    brick_size,
+    brick_host_xy,
+    host_size,
+    host_center_xy,
+    render_host=True,
+    render_sat=True,
+):
+    """
+    Build one common padded master image in nanomaggies/pixel.
+
+    The master image is large enough to support BOTH the brick output and the
+    host-centered output, with PSF padding, from a single render/convolution.
+    """
+    if not render_host and not render_sat:
+        raise ValueError("At least one of render_host or render_sat must be True.")
+
+    gid = np.asarray(galaxy_id, dtype=np.int16)
+
+    # 1) project to a common native pixel coordinate system
+    px0, py0 = _project_particles_to_pixel_offsets(
+        particles=particles,
+        camera=camera,
+        redshift=redshift,
+        cosmo=cosmo,
+        pixel_scale_arcsec=pixel_scale_arcsec,
+    )
+
+    # 2) align ONCE using host centroid independent of output footprint
+    host_c = _host_core_centroid_unbounded(
+        px=px0,
+        py=py0,
+        counts=counts,
+        galaxy_id=gid,
+        pixel_scale_arcsec=pixel_scale_arcsec,
+        psf_fwhm_arcsec=psf_fwhm_arcsec,
+        core_radius_pix=40,
+    )
+    if host_c is None:
+        raise RuntimeError("Could not determine host centroid for alignment.")
+
+    hx0, hy0 = host_c
+    x_rel = px0 - hx0
+    y_rel = py0 - hy0
+
+    # 3) define the two desired output windows in the host-relative frame
+    bx0, bx1, by0, by1 = _output_window_edges(brick_size, brick_host_xy)
+    hx0e, hx1e, hy0e, hy1e = _output_window_edges(host_size, host_center_xy)
+
+    sigma_pix = 0.0
+    if psf_fwhm_arcsec and psf_fwhm_arcsec > 0:
+        sigma_pix = (float(psf_fwhm_arcsec) / float(pixel_scale_arcsec)) / (
+            2.0 * np.sqrt(2.0 * np.log(2.0))
+        )
+    pad = int(np.ceil(4.0 * sigma_pix)) if sigma_pix > 0 else 0
+
+    # Use brick phase for the master grid, but enlarge it enough to hold both outputs.
+    left_needed = min(bx0, hx0e) - pad
+    top_needed = min(by0, hy0e) - pad
+    right_needed = max(bx1, hx1e) + pad
+    bottom_needed = max(by1, hy1e) + pad
+
+    master_x0_edge = bx0 - pad
+    master_y0_edge = by0 - pad
+
+    # Extend left/up only by integer numbers of pixels so the master grid stays
+    # phase-aligned with the brick grid.
+    if left_needed < master_x0_edge:
+        master_x0_edge -= float(np.ceil(master_x0_edge - left_needed))
+    if top_needed < master_y0_edge:
+        master_y0_edge -= float(np.ceil(master_y0_edge - top_needed))
+
+    master_w = int(np.ceil(right_needed - master_x0_edge))
+    master_h = int(np.ceil(bottom_needed - master_y0_edge))
+
+    if master_w <= 0 or master_h <= 0:
+        raise RuntimeError("Computed invalid master image size.")
+
+    render_mask = np.zeros(counts.shape[0], dtype=bool)
+    if render_host:
+        render_mask |= gid == 0
+    if render_sat:
+        render_mask |= gid == 1
+
+    valid = (
+        render_mask
+        & np.isfinite(x_rel)
+        & np.isfinite(y_rel)
+        & np.isfinite(counts)
+        & (x_rel >= master_x0_edge)
+        & (x_rel < master_x0_edge + master_w)
+        & (y_rel >= master_y0_edge)
+        & (y_rel < master_y0_edge + master_h)
+    )
+
+    master_img = np.histogram2d(
+        y_rel[valid],
+        x_rel[valid],
+        bins=[master_h, master_w],
+        range=[
+            [master_y0_edge, master_y0_edge + master_h],
+            [master_x0_edge, master_x0_edge + master_w],
+        ],
+        weights=counts[valid],
+    )[0].astype(np.float64)
+
+    # Add noise ONCE on the common master field
+    if noise_std and noise_std > 0:
+        master_img = master_img + np.random.normal(
+            0.0, float(noise_std), size=master_img.shape
+        )
+
+    # Convolve ONCE on the common master field
+    if sigma_pix > 0:
+        master_img = convolve(
+            master_img,
+            Gaussian2DKernel(sigma_pix),
+            boundary="fill",
+            fill_value=0.0,
+            normalize_kernel=True,
+        )
+
+    meta = {
+        "master_x0_edge": float(master_x0_edge),
+        "master_y0_edge": float(master_y0_edge),
+        "master_w": int(master_w),
+        "master_h": int(master_h),
+        "host_centroid_native": (float(hx0), float(hy0)),
+        "sigma_pix": float(sigma_pix),
+        "pad": int(pad),
+        "x_rel": x_rel,
+        "y_rel": y_rel,
+    }
+    return master_img, meta
+
+
+def _extract_from_master(
+    master_img,
+    master_x0_edge,
+    master_y0_edge,
+    output_size,
+    host_xy,
+    interp_order=1,
+):
+    """
+    Sample an output image from the common master field onto a specific pixel grid.
+
+    This handles the fact that the brick and host-centered outputs generally differ
+    by a fractional-pixel phase.
+    """
+    width, height = map(int, output_size)
+    hx, hy = map(float, host_xy)
+
+    # Output pixel-center locations in host-relative coordinates
+    x_out = np.arange(width, dtype=np.float64) - hx
+    y_out = np.arange(height, dtype=np.float64) - hy
+
+    # Convert host-relative coordinates to master array coordinates
+    # master pixel center j corresponds to x = master_x0_edge + 0.5 + j
+    u = x_out - (float(master_x0_edge) + 0.5)
+    v = y_out - (float(master_y0_edge) + 0.5)
+
+    uu, vv = np.meshgrid(u, v, indexing="xy")
+
+    out = ndimage.map_coordinates(
+        master_img,
+        [vv, uu],
+        order=int(interp_order),
+        mode="constant",
+        cval=0.0,
+        prefilter=(int(interp_order) > 1),
+    )
+    return np.asarray(out, dtype=np.float64)
+
+
+def _render_shared_outputs(
+    particles,
+    counts,
+    galaxy_id,
+    camera,
+    zp,
+    redshift,
+    cosmo,
+    pixel_scale_arcsec,
+    psf_fwhm_arcsec,
+    noise_std,
+    output_magnitude,
+    brick_size,
+    brick_host_xy,
+    host_size,
+    host_center_xy,
+    masses=None,
+    tail_bbox=None,
+    m_sat_total_overall=None,
+    m_host_total_overall=None,
+    render_host=True,
+    render_sat=True,
+):
+    """
+    Shared render path used by BOTH save_surface_brightness() and
+    save_host_centered_surface_brightness().
+
+    Returns
+    -------
+    brick_img, host_img, pixscale, tail_report
+    """
+    master_img, meta = _build_common_master_image(
+        particles=particles,
+        counts=counts,
+        galaxy_id=galaxy_id,
+        camera=camera,
+        pixel_scale_arcsec=pixel_scale_arcsec,
+        redshift=redshift,
+        cosmo=cosmo,
+        psf_fwhm_arcsec=psf_fwhm_arcsec,
+        noise_std=noise_std,
+        brick_size=brick_size,
+        brick_host_xy=brick_host_xy,
+        host_size=host_size,
+        host_center_xy=host_center_xy,
+        render_host=render_host,
+        render_sat=render_sat,
+    )
+
+    brick_img = _extract_from_master(
+        master_img=master_img,
+        master_x0_edge=meta["master_x0_edge"],
+        master_y0_edge=meta["master_y0_edge"],
+        output_size=brick_size,
+        host_xy=brick_host_xy,
+        interp_order=1,
+    )
+
+    host_img = _extract_from_master(
+        master_img=master_img,
+        master_x0_edge=meta["master_x0_edge"],
+        master_y0_edge=meta["master_y0_edge"],
+        output_size=host_size,
+        host_xy=host_center_xy,
+        interp_order=1,
+    )
+
+    tail_report = None
+    if (tail_bbox is not None) and (masses is not None):
+        x_rel = np.asarray(meta["x_rel"], dtype=np.float64)
+        y_rel = np.asarray(meta["y_rel"], dtype=np.float64)
+
+        px_brick = x_rel + float(brick_host_xy[0])
+        py_brick = y_rel + float(brick_host_xy[1])
+
+        brick_w, brick_h = map(int, brick_size)
+        valid_brick = (
+            np.isfinite(px_brick)
+            & np.isfinite(py_brick)
+            & np.isfinite(counts)
+            & (px_brick >= -0.5)
+            & (px_brick < brick_w - 0.5)
+            & (py_brick >= -0.5)
+            & (py_brick < brick_h - 0.5)
+        )
+
+        tail_report = _tail_bbox_report(
+            px=px_brick,
+            py=py_brick,
+            valid=valid_brick,
+            counts=counts,
+            masses=np.asarray(masses, dtype=np.float64),
+            galaxy_id=galaxy_id,
+            bbox=tail_bbox,
+            width=brick_w,
+            height=brick_h,
+            m_sat_total_overall=m_sat_total_overall,
+            m_host_total_overall=m_host_total_overall,
+        )
+
+    if output_magnitude:
+        brick_img = _nmgy_to_mu_image(
+            brick_img,
+            zp=zp,
+            pixel_scale_arcsec=pixel_scale_arcsec,
+            redshift=redshift,
+        )
+        host_img = _nmgy_to_mu_image(
+            host_img,
+            zp=zp,
+            pixel_scale_arcsec=pixel_scale_arcsec,
+            redshift=redshift,
+        )
+
+    return brick_img, host_img, float(pixel_scale_arcsec), tail_report
+
+
 def gadget_hdf5_movie(
     snap_format,
     step_size,
@@ -937,10 +1171,12 @@ def gadget_hdf5_movie(
 
     # Brick target pixels (0-based)
     host_xb, host_yb = brick_wcs.all_world2pix(host_ra, host_dec, 0)
-    sat_xb, sat_yb = brick_wcs.all_world2pix(sat_ra, sat_dec, 0)
+    sat_xb, sat_yb = brick_wcs.all_world2pix(sat_ra, sat_dec, 0)  # diagnostic only
     host_target_xy = (float(host_xb), float(host_yb))
-    sat_target_xy = (float(sat_xb), float(sat_yb))
-    print(f"Target cords in brick image:  host {host_target_xy} sat {sat_target_xy}")
+    print(
+        f"Target coords in brick image: host {host_target_xy} "
+        f"sat {(float(sat_xb), float(sat_yb))}"
+    )
 
     off_screen = recording and (not show_window)
     p = pv.Plotter(
@@ -1158,12 +1394,12 @@ def gadget_hdf5_movie(
 
         try:
             camera = p.camera
-            img, pixscale, tail_report = compute_surface_brightness_image(
-                coords,
-                counts,
-                gid,
-                camera,
-                (width_b, height_b),
+
+            brick_img, _host_img_unused, pixscale, tail_report = _render_shared_outputs(
+                particles=coords,
+                counts=counts,
+                galaxy_id=gid,
+                camera=camera,
                 zp=float(zp),
                 redshift=redshift,
                 cosmo=cosmo,
@@ -1171,21 +1407,36 @@ def gadget_hdf5_movie(
                 psf_fwhm_arcsec=float(psf_fwhm) if psf_fwhm is not None else 0.0,
                 noise_std=float(noise_std) if noise_std is not None else 0.0,
                 output_magnitude=bool(mag_out),
-                host_target_xy=host_target_xy,
-                sat_target_xy=sat_target_xy,
+                brick_size=(width_b, height_b),
+                brick_host_xy=host_target_xy,
+                host_size=(host_w, host_h),
+                host_center_xy=host_center_xy,
                 masses=masses,
                 tail_bbox=tail_bbox,
                 m_sat_total_overall=m_sat_total,
                 m_host_total_overall=m_host_total,
+                render_host=True,
+                render_sat=True,
             )
+            img = brick_img
         except Exception as e:
+            import traceback
+
+            print(traceback.format_exc())
             print(f"[Error] Failed to compute synthetic image: {e}", file=sys.stderr)
             return
 
         if debug_photometry:
-            print(
-                f"[DebugPhot] Flux rendered in image (sum over pixels, nmgy): {np.nansum(img):.6e}"
-            )
+            if bool(mag_out):
+                print(
+                    "[DebugPhot] Output image is in mag/arcsec^2; "
+                    "skipping sum-over-pixels flux check."
+                )
+            else:
+                print(
+                    f"[DebugPhot] Flux rendered in image (sum over pixels, nmgy): "
+                    f"{np.nansum(img):.6e}"
+                )
 
         if tail_report is not None and tail_report.get("ok", False):
             x0c, x1c, y0c, y1c = tail_report["bbox_clipped"]
@@ -1251,6 +1502,8 @@ def gadget_hdf5_movie(
             "Gaussian noise sigma added (output units)",
         )
         hdr["PIXSCL"] = (float(pixscale), "Pixel scale used in render (arcsec/pix)")
+        hdr["IMAGEW"] = (int(width_b), "Image width (pixels)")
+        hdr["IMAGEH"] = (int(height_b), "Image height (pixels)")
         hdr["FRAME"] = (int(current_frame), "Snapshot frame rendered")
         hdr["GIDH"] = (int(host_gid), "Sorted GalaxyID index used as host")
         hdr["GIDS"] = (int(sat_gid), "Sorted GalaxyID index used as satellite")
@@ -1282,14 +1535,7 @@ def gadget_hdf5_movie(
     host_w, host_h = map(int, host_image_size)
     host_center_xy = ((host_w - 1) / 2.0, (host_h - 1) / 2.0)
 
-    # Use the brick-derived sat offset if it fits in the host-centered frame; otherwise omit sat anchor
-    sat_dx = float(sat_xb - host_xb)
-    sat_dy = float(sat_yb - host_yb)
-    sat_target_host = (host_center_xy[0] + sat_dx, host_center_xy[1] + sat_dy)
-    if not (0 <= sat_target_host[0] < host_w and 0 <= sat_target_host[1] < host_h):
-        sat_target_host = None
-
-    def save_host_centered_surface_brightness():
+    def save_host_centered_surface_brightness(satellite_only=False):
         global current_frame
         try:
             coords, counts, gid, masses, m_host_total, m_sat_total = (
@@ -1307,7 +1553,7 @@ def gadget_hdf5_movie(
                     return float("nan")
                 return float(zp) - 2.5 * np.log10(f)
 
-            # Integrated flux per galaxy from particle counts (nmgy)
+            # These diagnostics are still based on the full particle lists
             f_host = float(np.sum(counts[gid == 0]))
             f_sat = float(np.sum(counts[gid == 1]))
 
@@ -1320,7 +1566,6 @@ def gadget_hdf5_movie(
             dm_host = m_host_model - m_host_obs
             dm_sat = m_sat_model - m_sat_obs
 
-            # flux ratio model/obs implied by dm (10^{-0.4 dm})
             fr_host = 10.0 ** (-0.4 * dm_host) if np.isfinite(dm_host) else float("nan")
             fr_sat = 10.0 ** (-0.4 * dm_sat) if np.isfinite(dm_sat) else float("nan")
 
@@ -1328,31 +1573,45 @@ def gadget_hdf5_movie(
                 "[DebugPhot] Integrated apparent magnitudes from particle counts (AB):"
             )
             print(
-                f"[DebugPhot]   Host: F={f_host:.6e} nmgy  m_model={m_host_model:.4f}  m_obs(r)={m_host_obs:.4f}  dm={dm_host:+.4f}  (F_model/F_obs={fr_host:.3f})"
+                f"[DebugPhot]   Host: F={f_host:.6e} nmgy  "
+                f"m_model={m_host_model:.4f}  m_obs(r)={m_host_obs:.4f}  "
+                f"dm={dm_host:+.4f}  (F_model/F_obs={fr_host:.3f})"
             )
             print(
-                f"[DebugPhot]   Sat : F={f_sat:.6e} nmgy  m_model={m_sat_model:.4f}  m_obs(r)={m_sat_obs:.4f}  dm={dm_sat:+.4f}  (F_model/F_obs={fr_sat:.3f})"
+                f"[DebugPhot]   Sat : F={f_sat:.6e} nmgy  "
+                f"m_model={m_sat_model:.4f}  m_obs(r)={m_sat_obs:.4f}  "
+                f"dm={dm_sat:+.4f}  (F_model/F_obs={fr_sat:.3f})"
             )
 
         try:
             camera = p.camera
-            img, pixscale, tail_report = compute_surface_brightness_image(
-                coords,
-                counts,
-                gid,
-                camera,
-                (host_w, host_h),
-                zp=float(zp),
-                redshift=redshift,
-                cosmo=cosmo,
-                pixel_scale_arcsec=float(brick_pixscale),
-                psf_fwhm_arcsec=float(psf_fwhm) if psf_fwhm is not None else 0.0,
-                noise_std=float(noise_std) if noise_std is not None else 0.0,
-                output_magnitude=bool(mag_out),
-                host_target_xy=host_center_xy,
-                sat_target_xy=sat_target_host,
+
+            _brick_img_unused, host_img, pixscale, _tail_report_unused = (
+                _render_shared_outputs(
+                    particles=coords,
+                    counts=counts,
+                    galaxy_id=gid,
+                    camera=camera,
+                    zp=float(zp),
+                    redshift=redshift,
+                    cosmo=cosmo,
+                    pixel_scale_arcsec=float(brick_pixscale),
+                    psf_fwhm_arcsec=float(psf_fwhm) if psf_fwhm is not None else 0.0,
+                    noise_std=float(noise_std) if noise_std is not None else 0.0,
+                    output_magnitude=bool(mag_out),
+                    brick_size=(width_b, height_b),
+                    brick_host_xy=host_target_xy,
+                    host_size=(host_w, host_h),
+                    host_center_xy=host_center_xy,
+                    render_host=(not satellite_only),
+                    render_sat=True,
+                )
             )
+            img = host_img
         except Exception as e:
+            import traceback
+
+            print(traceback.format_exc())
             print(
                 f"[Error] Failed to compute host-centered synthetic image: {e}",
                 file=sys.stderr,
@@ -1360,17 +1619,27 @@ def gadget_hdf5_movie(
             return
 
         if debug_photometry:
-            print(
-                f"[DebugPhot] Flux rendered in image (sum over pixels, nmgy): {np.nansum(img):.6e}"
-            )
+            if bool(mag_out):
+                print(
+                    "[DebugPhot] Output image is in mag/arcsec^2; "
+                    "skipping sum-over-pixels flux check."
+                )
+            else:
+                print(
+                    f"[DebugPhot] Flux rendered in image (sum over pixels, nmgy): "
+                    f"{np.nansum(img):.6e}"
+                )
 
-        # Prompt for filename via Tkinter
         filename = None
         try:
             root = tk.Tk()
             root.withdraw()
             fn = filedialog.asksaveasfilename(
-                title="Save simulated FITS (host-centered)",
+                title=(
+                    "Save simulated FITS (host-centered, satellite-only)"
+                    if satellite_only
+                    else "Save simulated FITS (host-centered)"
+                ),
                 defaultextension=".fits",
                 filetypes=[("FITS files", "*.fits"), ("All files", "*.*")],
             )
@@ -1379,23 +1648,21 @@ def gadget_hdf5_movie(
                 filename = fn
         except Exception:
             filename = input(
-                "Enter output FITS filename (e.g., host_centered.fits): "
+                "Enter output FITS filename "
+                f"({'sat_only' if satellite_only else 'host_centered'}.fits): "
             ).strip()
 
         if not filename:
             print("Save cancelled.", file=sys.stderr)
             return
 
-        # Build WCS centered on the host, same orientation/scale as the brick
         hdr = make_host_centered_wcs_header(
-            brick_wcs=brick_wcs,
             brick_hdr=brick_hdr,
-            host_image_size=host_image_size,  # (3000, 3000) by default
+            host_image_size=host_image_size,
             host_ra_deg=host_ra,
             host_dec_deg=host_dec,
         )
 
-        # Add the same provenance keywords you already write for brick-aligned images
         hdr["ZP"] = (float(zp), "Zero point magnitude used (nanomaggies convention)")
         hdr["REDSHFT"] = (float(redshift), "Redshift used for distance modulus")
         hdr["MLHOST"] = (float(ml_host), "Host M/L_r (solar units)")
@@ -1418,21 +1685,46 @@ def gadget_hdf5_movie(
         hdr["GIDS"] = (int(sat_gid), "Sorted GalaxyID index used as satellite")
 
         hdr["IMTYPE"] = ("HOSTCTR", "Host-centered synthetic render")
-        hdr["IMW"] = (int(host_w), "Image width (pixels)")
-        hdr["IMH"] = (int(host_h), "Image height (pixels)")
+        hdr["IMAGEW"] = (int(host_w), "Image width (pixels)")
+        hdr["IMAGEH"] = (int(host_h), "Image height (pixels)")
+        hdr["RENDER"] = (
+            "SATONLY" if satellite_only else "BOTH",
+            "Rendered components",
+        )
 
         if bool(mag_out):
-            hdr["COMMENT"] = "Synthetic image in mag/arcsec^2, host-centered WCS."
+            hdr["COMMENT"] = (
+                "Synthetic image in mag/arcsec^2, host-centered WCS, satellite-only."
+                if satellite_only
+                else "Synthetic image in mag/arcsec^2, host-centered WCS."
+            )
         else:
-            hdr["COMMENT"] = "Synthetic image in nanomaggies/pixel, host-centered WCS."
+            hdr["COMMENT"] = (
+                "Synthetic image in nanomaggies/pixel, host-centered WCS, satellite-only."
+                if satellite_only
+                else "Synthetic image in nanomaggies/pixel, host-centered WCS."
+            )
+
         hdu = fits.PrimaryHDU(np.asarray(img, dtype=np.float32), header=hdr)
         try:
             hdu.writeto(filename, overwrite=True)
-            print(f"Saved host aligned synthetic FITS to: {filename}")
+            print(
+                (
+                    "Saved host-centered satellite-only FITS to:"
+                    if satellite_only
+                    else "Saved host-centered FITS to:"
+                ),
+                filename,
+            )
         except Exception as e:
-            print(f"[Error] Failed to write FITS file: {e}", file=sys.stderr)
+            print(f"[Erro] Failed to write FITS file: {e}", file=sys.stderr)
 
-    p.add_key_event("h", save_host_centered_surface_brightness)
+    p.add_key_event(
+        "h", lambda: save_host_centered_surface_brightness(satellite_only=False)
+    )
+    p.add_key_event(
+        "z", lambda: save_host_centered_surface_brightness(satellite_only=True)
+    )
 
     # Initialize render window
     p.show(auto_close=False, interactive_update=show_window)
