@@ -59,6 +59,10 @@ def update_wcs_for_block(header, B, out_shape):
         if k in hdr:
             del hdr[k]
 
+    # Update PIXSCL and A_SEC2
+    if "PIXSCL" in hdr:
+        hdr["PIXSCL"] *= B
+
     # Leave SIP/TPV if present (not re-fit). For exact wide-field geometry, reproject later.
     return hdr
 
