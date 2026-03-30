@@ -510,6 +510,21 @@ def _build_master_sigma_from_brick_sigma(
     return master_sigma, fill_sigma
 
 
+def _make_frame_rng(noise_seed, frame_num):
+    """
+    Return a reproducible RNG for a given frame.
+
+    If noise_seed is None, return a fresh non-deterministic RNG.
+    If noise_seed is set, the RNG is deterministic for each frame, so
+    repeated saves of the same frame get identical noise.
+    """
+    if noise_seed is None:
+        return np.random.default_rng()
+
+    ss = np.random.SeedSequence([int(noise_seed), int(frame_num)])
+    return np.random.default_rng(ss)
+
+
 # ----------------------------
 # Event handlers
 # ----------------------------
@@ -889,6 +904,7 @@ def _build_common_master_image(
     render_host=True,
     render_sat=True,
     brick_sigma_map=None,
+    rng=None,
 ):
     """
     Build one common padded master image in nanomaggies/pixel.
@@ -903,6 +919,9 @@ def _build_common_master_image(
     """
     if not render_host and not render_sat:
         raise ValueError("At least one of render_host or render_sat must be True.")
+
+    if rng is None:
+        rng = np.random.default_rng()
 
     gid = np.asarray(galaxy_id, dtype=np.int16)
 
@@ -1018,14 +1037,14 @@ def _build_common_master_image(
             brick_size=brick_size,
             brick_host_xy=brick_host_xy,
         )
-        master_img = master_img + np.random.normal(
+        master_img = master_img + rng.normal(
             loc=0.0,
             scale=master_sigma,
             size=master_img.shape,
         )
         noise_mode = "INVVAR"
     elif noise_std and noise_std > 0:
-        master_img = master_img + np.random.normal(
+        master_img = master_img + rng.normal(
             loc=0.0,
             scale=float(noise_std),
             size=master_img.shape,
@@ -1110,6 +1129,7 @@ def _render_shared_outputs(
     render_host=True,
     render_sat=True,
     brick_sigma_map=None,
+    rng=None,
 ):
     """
     Shared render path used by BOTH save_surface_brightness() and
@@ -1136,8 +1156,8 @@ def _render_shared_outputs(
         render_host=render_host,
         render_sat=render_sat,
         brick_sigma_map=brick_sigma_map,
+        rng=rng,
     )
-
     brick_img = _extract_from_master(
         master_img=master_img,
         master_x0_edge=meta["master_x0_edge"],
@@ -1227,6 +1247,7 @@ def gadget_hdf5_movie(
     brick_shape=None,
     brick_pixscale=None,
     brick_invvar=None,
+    noise_seed=None,
     fps=None,
     show_window=True,
     window_size=(1280, 720),
@@ -1541,7 +1562,7 @@ def gadget_hdf5_movie(
 
         try:
             camera = p.camera
-
+            rng = _make_frame_rng(noise_seed, current_frame)
             brick_img, _host_img_unused, pixscale, tail_report, render_meta = (
                 _render_shared_outputs(
                     particles=coords,
@@ -1566,6 +1587,7 @@ def gadget_hdf5_movie(
                     render_host=True,
                     render_sat=True,
                     brick_sigma_map=brick_sigma_map,
+                    rng=rng,
                 )
             )
             img = brick_img
@@ -1661,6 +1683,10 @@ def gadget_hdf5_movie(
             str(render_meta.get("noise_mode", "UNKNOWN")),
             "Noise model: GLOBAL, INVVAR, or NONE",
         )
+        hdr["NOISESED"] = (
+            int(noise_seed) if noise_seed is not None else -1,
+            "Base random seed for noise; -1 means non-deterministic",
+        )
         if (
             render_meta.get("noise_mode") == "INVVAR"
             and render_meta.get("noise_fill_sigma") is not None
@@ -1746,7 +1772,7 @@ def gadget_hdf5_movie(
             )
         try:
             camera = p.camera
-
+            rng = _make_frame_rng(noise_seed, current_frame)
             _brick_img_unused, host_img, pixscale, _tail_report_unused, render_meta = (
                 _render_shared_outputs(
                     particles=coords,
@@ -1767,6 +1793,7 @@ def gadget_hdf5_movie(
                     render_host=(not satellite_only),
                     render_sat=True,
                     brick_sigma_map=brick_sigma_map,
+                    rng=rng,
                 )
             )
             img = host_img
@@ -1844,6 +1871,10 @@ def gadget_hdf5_movie(
         hdr["NOISEMOD"] = (
             str(render_meta.get("noise_mode", "UNKNOWN")),
             "Noise model: GLOBAL, INVVAR, or NONE",
+        )
+        hdr["NOISESED"] = (
+            int(noise_seed) if noise_seed is not None else -1,
+            "Base random seed for noise; -1 means non-deterministic",
         )
         if (
             render_meta.get("noise_mode") == "INVVAR"
@@ -2110,6 +2141,15 @@ def main():
         ),
     )
     parser.add_argument(
+        "--noise-seed",
+        type=int,
+        default=None,
+        help=(
+            "Optional base RNG seed for synthetic noise. "
+            "If set, the same frame will always get the same noise realization."
+        ),
+    )
+    parser.add_argument(
         "--psf", type=float, default=0.0, help="PSF FWHM to convolve (arcsec)"
     )
     parser.add_argument(
@@ -2217,6 +2257,7 @@ def main():
         brick_shape=brick_shape,
         brick_pixscale=brick_pixscale,
         brick_invvar=brick_invvar,
+        noise_seed=args.noise_seed,
         fps=args.fps,
         show_window=show_window,
         window_size=tuple(args.window_size),
