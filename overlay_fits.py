@@ -102,6 +102,25 @@ def normalize(
     return y
 
 
+def build_overlay_alpha(
+    norm_img: np.ndarray,
+    alpha: float,
+    transparent_below: float | None = None,
+) -> np.ndarray:
+    """
+    Build per-pixel alpha for the overlay.
+    - NaNs are always transparent.
+    - If transparent_below is set, pixels with normalized value <= threshold
+      are also transparent.
+    """
+    mask = np.isfinite(norm_img)
+
+    if transparent_below is not None:
+        mask &= np.nan_to_num(norm_img, nan=-np.inf) > float(transparent_below)
+
+    return float(alpha) * mask.astype(np.float32)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Overlay two co-registered FITS images with adjustable opacity."
@@ -147,6 +166,16 @@ def main():
         nargs=2,
         default=(50.0, 98.0),
         metavar=("PLO", "PHI"),
+    )
+
+    ap.add_argument(
+        "--overlay-transparent-below",
+        type=float,
+        default=None,
+        help=(
+            "If set, make overlay pixels with normalized value <= this threshold "
+            "transparent (range 0..1). Example: 0.0 or 0.02"
+        ),
     )
     ap.add_argument("--base-gamma", type=float, default=1.0)
     ap.add_argument("--overlay-gamma", type=float, default=1.0)
@@ -216,7 +245,11 @@ def main():
         vmax=1.0,
     )
 
-    alpha0 = float(args.alpha) * np.isfinite(over_n).astype(np.float32)
+    alpha0 = build_overlay_alpha(
+        over_n,
+        args.alpha,
+        transparent_below=args.overlay_transparent_below,
+    )
 
     im_over = ax.imshow(
         over_n,
@@ -276,6 +309,7 @@ def main():
         p_lo, p_hi = map(float, s_over_pct.val)
         if p_hi <= p_lo:
             return
+
         new_over = normalize(
             over,
             p_lo,
@@ -285,13 +319,21 @@ def main():
         )
         im_over.set_data(new_over)
 
-        a = float(s_alpha.val) * np.isfinite(new_over).astype(np.float32)
+        a = build_overlay_alpha(
+            new_over,
+            s_alpha.val,
+            transparent_below=args.overlay_transparent_below,
+        )
         im_over.set_alpha(a)
         fig.canvas.draw_idle()
 
     def on_alpha(val):
-        current_over = im_over.get_array()
-        a = float(val) * np.isfinite(current_over).astype(np.float32)
+        current_over = np.asarray(im_over.get_array())
+        a = build_overlay_alpha(
+            current_over,
+            val,
+            transparent_below=args.overlay_transparent_below,
+        )
         im_over.set_alpha(a)
         fig.canvas.draw_idle()
 
@@ -308,7 +350,17 @@ def main():
         if out is None:
             out = "overlay.png"
         out = str(Path(out).expanduser())
-        fig.savefig(out, dpi=200, bbox_inches="tight")
+
+        # Crop output to the image axes only (excludes sliders/buttons)
+        fig.canvas.draw()  # ensure positions are finalized
+        bbox = ax.get_window_extent().transformed(fig.dpi_scale_trans.inverted())
+
+        fig.savefig(
+            out,
+            dpi=200,
+            bbox_inches=bbox,
+            pad_inches=0,
+        )
         print(f"Saved: {out}")
 
     btn.on_clicked(do_save)
