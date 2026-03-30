@@ -421,6 +421,95 @@ def _counts_from_masses(
     return counts
 
 
+def read_fits_2d(path: Path, hdu: int = 1):
+    """
+    Read a 2D FITS image and return (data, header).
+    """
+    with fits.open(path, memmap=True) as hdul:
+        data = np.asarray(hdul[hdu].data, dtype=np.float64)
+        hdr = hdul[hdu].header.copy()
+
+    if data.ndim != 2:
+        raise RuntimeError(f"{path} HDU {hdu} is not 2D; got shape {data.shape}")
+    return data, hdr
+
+
+def _sigma_from_invvar(invvar):
+    """
+    Convert invvar [1 / (nanomaggies)^2] -> sigma [nanomaggies / pixel].
+    """
+    invvar = np.asarray(invvar, dtype=np.float64)
+    sigma = np.full(invvar.shape, np.nan, dtype=np.float64)
+
+    good = np.isfinite(invvar) & (invvar > 0)
+    sigma[good] = 1.0 / np.sqrt(invvar[good])
+    return sigma
+
+
+def _build_master_sigma_from_brick_sigma(
+    brick_sigma_map,
+    *,
+    master_x0_edge,
+    master_y0_edge,
+    master_w,
+    master_h,
+    brick_size,
+    brick_host_xy,
+):
+    """
+    Build a sigma map on the common master grid from the brick-grid sigma map.
+
+    Because the master grid is phase-aligned with the brick grid, this is just
+    an integer placement of the brick sigma map into the larger master image.
+
+    Pixels outside the brick footprint are filled with the median valid brick sigma.
+    """
+    brick_w, brick_h = map(int, brick_size)
+
+    brick_sigma_map = np.asarray(brick_sigma_map, dtype=np.float64)
+    if brick_sigma_map.shape != (brick_h, brick_w):
+        raise RuntimeError(
+            f"brick sigma map shape {brick_sigma_map.shape} does not match "
+            f"brick image shape {(brick_h, brick_w)}"
+        )
+
+    valid = np.isfinite(brick_sigma_map) & (brick_sigma_map > 0)
+    if not np.any(valid):
+        raise RuntimeError("No valid pixels in brick sigma map derived from invvar.")
+
+    fill_sigma = float(np.nanmedian(brick_sigma_map[valid]))
+
+    master_sigma = np.full((master_h, master_w), fill_sigma, dtype=np.float64)
+
+    # Location of brick pixel (0,0) within the master array.
+    x0_float = -float(brick_host_xy[0]) - (float(master_x0_edge) + 0.5)
+    y0_float = -float(brick_host_xy[1]) - (float(master_y0_edge) + 0.5)
+
+    x0 = int(round(x0_float))
+    y0 = int(round(y0_float))
+
+    if abs(x0_float - x0) > 1e-6 or abs(y0_float - y0) > 1e-6:
+        raise RuntimeError(
+            "Master grid is not phase-aligned with the brick grid as expected: "
+            f"x0_float={x0_float}, y0_float={y0_float}"
+        )
+
+    x1 = x0 + brick_w
+    y1 = y0 + brick_h
+
+    if x0 < 0 or y0 < 0 or x1 > master_w or y1 > master_h:
+        raise RuntimeError(
+            "Brick sigma map placement falls outside master image: "
+            f"x=[{x0},{x1}) of {master_w}, y=[{y0},{y1}) of {master_h}"
+        )
+
+    brick_sigma_filled = brick_sigma_map.copy()
+    brick_sigma_filled[~valid] = fill_sigma
+
+    master_sigma[y0:y1, x0:x1] = brick_sigma_filled
+    return master_sigma, fill_sigma
+
+
 # ----------------------------
 # Event handlers
 # ----------------------------
@@ -799,12 +888,18 @@ def _build_common_master_image(
     host_center_xy,
     render_host=True,
     render_sat=True,
+    brick_sigma_map=None,
 ):
     """
     Build one common padded master image in nanomaggies/pixel.
 
     The master image is large enough to support BOTH the brick output and the
     host-centered output, with PSF padding, from a single render/convolution.
+
+    Noise handling:
+      - if brick_sigma_map is provided, use that spatially varying sigma map
+        (derived from invvar) and ignore noise_std
+      - otherwise use scalar noise_std
     """
     if not render_host and not render_sat:
         raise ValueError("At least one of render_host or render_sat must be True.")
@@ -887,6 +982,7 @@ def _build_common_master_image(
         & (y_rel < master_y0_edge + master_h)
     )
 
+    # Render signal only
     master_img = np.histogram2d(
         y_rel[valid],
         x_rel[valid],
@@ -898,13 +994,7 @@ def _build_common_master_image(
         weights=counts[valid],
     )[0].astype(np.float64)
 
-    # Add noise ONCE on the common master field
-    if noise_std and noise_std > 0:
-        master_img = master_img + np.random.normal(
-            0.0, float(noise_std), size=master_img.shape
-        )
-
-    # Convolve ONCE on the common master field
+    # Convolve signal only
     if sigma_pix > 0:
         master_img = convolve(
             master_img,
@@ -913,6 +1003,34 @@ def _build_common_master_image(
             fill_value=0.0,
             normalize_kernel=True,
         )
+
+    noise_mode = "NONE"
+    noise_fill_sigma = None
+
+    # Add noise AFTER PSF convolution
+    if brick_sigma_map is not None:
+        master_sigma, noise_fill_sigma = _build_master_sigma_from_brick_sigma(
+            brick_sigma_map,
+            master_x0_edge=master_x0_edge,
+            master_y0_edge=master_y0_edge,
+            master_w=master_w,
+            master_h=master_h,
+            brick_size=brick_size,
+            brick_host_xy=brick_host_xy,
+        )
+        master_img = master_img + np.random.normal(
+            loc=0.0,
+            scale=master_sigma,
+            size=master_img.shape,
+        )
+        noise_mode = "INVVAR"
+    elif noise_std and noise_std > 0:
+        master_img = master_img + np.random.normal(
+            loc=0.0,
+            scale=float(noise_std),
+            size=master_img.shape,
+        )
+        noise_mode = "GLOBAL"
 
     meta = {
         "master_x0_edge": float(master_x0_edge),
@@ -924,6 +1042,8 @@ def _build_common_master_image(
         "pad": int(pad),
         "x_rel": x_rel,
         "y_rel": y_rel,
+        "noise_mode": noise_mode,
+        "noise_fill_sigma": noise_fill_sigma,
     }
     return master_img, meta
 
@@ -989,6 +1109,7 @@ def _render_shared_outputs(
     m_host_total_overall=None,
     render_host=True,
     render_sat=True,
+    brick_sigma_map=None,
 ):
     """
     Shared render path used by BOTH save_surface_brightness() and
@@ -996,7 +1117,7 @@ def _render_shared_outputs(
 
     Returns
     -------
-    brick_img, host_img, pixscale, tail_report
+    brick_img, host_img, pixscale, tail_report, render_meta
     """
     master_img, meta = _build_common_master_image(
         particles=particles,
@@ -1014,6 +1135,7 @@ def _render_shared_outputs(
         host_center_xy=host_center_xy,
         render_host=render_host,
         render_sat=render_sat,
+        brick_sigma_map=brick_sigma_map,
     )
 
     brick_img = _extract_from_master(
@@ -1081,7 +1203,7 @@ def _render_shared_outputs(
             redshift=redshift,
         )
 
-    return brick_img, host_img, float(pixel_scale_arcsec), tail_report
+    return brick_img, host_img, float(pixel_scale_arcsec), tail_report, meta
 
 
 def gadget_hdf5_movie(
@@ -1102,8 +1224,9 @@ def gadget_hdf5_movie(
     host_image_size=(3000, 3000),
     brick_hdr=None,
     brick_wcs=None,
-    brick_shape=None,  # (ny, nx)
-    brick_pixscale=None,  # arcsec/pix
+    brick_shape=None,
+    brick_pixscale=None,
+    brick_invvar=None,
     fps=None,
     show_window=True,
     window_size=(1280, 720),
@@ -1168,6 +1291,30 @@ def gadget_hdf5_movie(
 
     ny_b, nx_b = brick_shape
     width_b, height_b = nx_b, ny_b
+
+    brick_sigma_map = None
+    if brick_invvar is not None:
+        brick_invvar = np.asarray(brick_invvar, dtype=np.float64)
+        if brick_invvar.shape != (height_b, width_b):
+            raise RuntimeError(
+                f"brick_invvar shape {brick_invvar.shape} does not match "
+                f"brick image shape {(height_b, width_b)}"
+            )
+
+        brick_sigma_map = _sigma_from_invvar(brick_invvar)
+        good_sigma = np.isfinite(brick_sigma_map) & (brick_sigma_map > 0)
+        if not np.any(good_sigma):
+            raise RuntimeError("No valid sigma values derived from brick_invvar.")
+
+        print(
+            "[Noise] Using invvar-based noise map. "
+            f"Median sigma = {np.nanmedian(brick_sigma_map[good_sigma]):.6e} nmgy/pix"
+        )
+    else:
+        print(
+            "[Noise] Using global scalar noise sigma. "
+            f"sigma = {float(noise_std) if noise_std is not None else 0.0:.6e} nmgy/pix"
+        )
 
     # Brick target pixels (0-based)
     host_xb, host_yb = brick_wcs.all_world2pix(host_ra, host_dec, 0)
@@ -1395,28 +1542,31 @@ def gadget_hdf5_movie(
         try:
             camera = p.camera
 
-            brick_img, _host_img_unused, pixscale, tail_report = _render_shared_outputs(
-                particles=coords,
-                counts=counts,
-                galaxy_id=gid,
-                camera=camera,
-                zp=float(zp),
-                redshift=redshift,
-                cosmo=cosmo,
-                pixel_scale_arcsec=float(brick_pixscale),
-                psf_fwhm_arcsec=float(psf_fwhm) if psf_fwhm is not None else 0.0,
-                noise_std=float(noise_std) if noise_std is not None else 0.0,
-                output_magnitude=bool(mag_out),
-                brick_size=(width_b, height_b),
-                brick_host_xy=host_target_xy,
-                host_size=(host_w, host_h),
-                host_center_xy=host_center_xy,
-                masses=masses,
-                tail_bbox=tail_bbox,
-                m_sat_total_overall=m_sat_total,
-                m_host_total_overall=m_host_total,
-                render_host=True,
-                render_sat=True,
+            brick_img, _host_img_unused, pixscale, tail_report, render_meta = (
+                _render_shared_outputs(
+                    particles=coords,
+                    counts=counts,
+                    galaxy_id=gid,
+                    camera=camera,
+                    zp=float(zp),
+                    redshift=redshift,
+                    cosmo=cosmo,
+                    pixel_scale_arcsec=float(brick_pixscale),
+                    psf_fwhm_arcsec=float(psf_fwhm) if psf_fwhm is not None else 0.0,
+                    noise_std=float(noise_std) if noise_std is not None else 0.0,
+                    output_magnitude=bool(mag_out),
+                    brick_size=(width_b, height_b),
+                    brick_host_xy=host_target_xy,
+                    host_size=(host_w, host_h),
+                    host_center_xy=host_center_xy,
+                    masses=masses,
+                    tail_bbox=tail_bbox,
+                    m_sat_total_overall=m_sat_total,
+                    m_host_total_overall=m_host_total,
+                    render_host=True,
+                    render_sat=True,
+                    brick_sigma_map=brick_sigma_map,
+                )
             )
             img = brick_img
         except Exception as e:
@@ -1507,6 +1657,18 @@ def gadget_hdf5_movie(
         hdr["FRAME"] = (int(current_frame), "Snapshot frame rendered")
         hdr["GIDH"] = (int(host_gid), "Sorted GalaxyID index used as host")
         hdr["GIDS"] = (int(sat_gid), "Sorted GalaxyID index used as satellite")
+        hdr["NOISEMOD"] = (
+            str(render_meta.get("noise_mode", "UNKNOWN")),
+            "Noise model: GLOBAL, INVVAR, or NONE",
+        )
+        if (
+            render_meta.get("noise_mode") == "INVVAR"
+            and render_meta.get("noise_fill_sigma") is not None
+        ):
+            hdr["NFILLSIG"] = (
+                float(render_meta["noise_fill_sigma"]),
+                "Sigma used outside brick footprint (nmgy/pix)",
+            )
         hdr["GNAMEH"] = (
             str(gal_names[host_gid]),
             "GalaxyID_Name for host (from snapshot)",
@@ -1582,11 +1744,10 @@ def gadget_hdf5_movie(
                 f"m_model={m_sat_model:.4f}  m_obs(r)={m_sat_obs:.4f}  "
                 f"dm={dm_sat:+.4f}  (F_model/F_obs={fr_sat:.3f})"
             )
-
         try:
             camera = p.camera
 
-            _brick_img_unused, host_img, pixscale, _tail_report_unused = (
+            _brick_img_unused, host_img, pixscale, _tail_report_unused, render_meta = (
                 _render_shared_outputs(
                     particles=coords,
                     counts=counts,
@@ -1605,6 +1766,7 @@ def gadget_hdf5_movie(
                     host_center_xy=host_center_xy,
                     render_host=(not satellite_only),
                     render_sat=True,
+                    brick_sigma_map=brick_sigma_map,
                 )
             )
             img = host_img
@@ -1679,6 +1841,18 @@ def gadget_hdf5_movie(
             float(noise_std) if noise_std is not None else 0.0,
             "Gaussian noise sigma added (output units)",
         )
+        hdr["NOISEMOD"] = (
+            str(render_meta.get("noise_mode", "UNKNOWN")),
+            "Noise model: GLOBAL, INVVAR, or NONE",
+        )
+        if (
+            render_meta.get("noise_mode") == "INVVAR"
+            and render_meta.get("noise_fill_sigma") is not None
+        ):
+            hdr["NFILLSIG"] = (
+                float(render_meta["noise_fill_sigma"]),
+                "Sigma used outside brick footprint (nmgy/pix)",
+            )
         hdr["PIXSCL"] = (float(pixscale), "Pixel scale used in render (arcsec/pix)")
         hdr["FRAME"] = (int(current_frame), "Snapshot frame rendered")
         hdr["GIDH"] = (int(host_gid), "Sorted GalaxyID index used as host")
@@ -1912,10 +2086,28 @@ def main():
         help="Zero point magnitude (Legacy nanomaggies convention)",
     )
     parser.add_argument(
+        "--invvar-file",
+        type=Path,
+        default=None,
+        help=(
+            "Optional Legacy Survey invvar FITS to use as the noise model. "
+            "If provided, this overrides --noise."
+        ),
+    )
+    parser.add_argument(
+        "--invvar-hdu",
+        type=int,
+        default=1,
+        help="HDU for --invvar-file (default 1)",
+    )
+    parser.add_argument(
         "--noise",
         type=float,
         default=0.01,
-        help="Gaussian noise sigma in 1 pixel (Legacy Survey is 0.01)(same units as output)",
+        help=(
+            "Global Gaussian noise sigma in nanomaggies/pixel. "
+            "Ignored if --invvar-file is provided."
+        ),
     )
     parser.add_argument(
         "--psf", type=float, default=0.0, help="PSF FWHM to convolve (arcsec)"
@@ -1988,7 +2180,18 @@ def main():
     brick_shape, brick_hdr, brick_wcs, brick_pixscale = read_brick_wcs_shape(
         args.brick_file, brick_hdu=int(args.brick_hdu)
     )
+    brick_invvar = None
+    if args.invvar_file is not None:
+        brick_invvar, invvar_hdr = read_fits_2d(
+            args.invvar_file, hdu=int(args.invvar_hdu)
+        )
 
+        ny_b, nx_b = brick_shape
+        if brick_invvar.shape != (ny_b, nx_b):
+            raise RuntimeError(
+                f"--invvar-file shape {brick_invvar.shape} does not match "
+                f"--brick-file shape {(ny_b, nx_b)}"
+            )
     start_frame = args.start_frame
     end_frame = args.end_frame
     show_window = True if args.mp4 is None else args.show
@@ -2013,6 +2216,7 @@ def main():
         brick_wcs=brick_wcs,
         brick_shape=brick_shape,
         brick_pixscale=brick_pixscale,
+        brick_invvar=brick_invvar,
         fps=args.fps,
         show_window=show_window,
         window_size=tuple(args.window_size),
