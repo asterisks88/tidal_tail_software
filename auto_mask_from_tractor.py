@@ -2,10 +2,12 @@
 """
 auto_mask_from_tractor.py
 
-Generate a simple maskbits-like image (0=good, nonzero=masked) aligned to a Legacy Survey coadd image.
+Generate a simple maskbits-like image (0=good, nonzero=masked) aligned to a
+Legacy Survey coadd image.
 
 - Stars (type == PSF): circular masks
-- Galaxies (type != PSF): elliptical masks derived from (shape_r, shape_e1, shape_e2)
+- Galaxies (type != PSF): elliptical masks derived from
+  (shape_r, shape_e1, shape_e2)
 
 Designed for DR10 Tractor catalogs:
   type: PSF/REX/DEV/EXP/SER ...
@@ -13,7 +15,8 @@ Designed for DR10 Tractor catalogs:
   shape_e1, shape_e2: ellipticity components
 
 References:
-- DR10 tractor catalog columns (type, shape_r, shape_e1/e2) are documented on the Legacy Survey site.
+- DR10 tractor catalog columns (type, shape_r, shape_e1/e2) are documented on
+  the Legacy Survey site.
 
 Typical use:
   ./auto_mask_from_tractor.py \
@@ -23,6 +26,9 @@ Typical use:
     --pixscale-arcsec 0.262 \
     --maglim 24.5 \
     --star-kfwhm 3.0 \
+    --star-mag-scale linear \
+    --star-mag-alpha 0.35 \
+    --star-mag-max-factor 4.0 \
     --gal-kre 4.0 \
     --keep-circle 3200,1550,220 \
     --out-maskbits maskbits_auto.fits
@@ -35,7 +41,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import numpy as np
 from astropy.io import fits
@@ -59,11 +65,14 @@ def read_table(path: Path, hdu: int) -> np.ndarray:
 
 
 def nanomaggies_to_abmag(flux_nmgy: np.ndarray) -> np.ndarray:
-    # Legacy nanomaggies: mag = 22.5 - 2.5 log10(flux)
+    """
+    Legacy nanomaggies convention:
+      mag = 22.5 - 2.5 log10(flux_nmgy)
+    """
     f = np.asarray(flux_nmgy, dtype=np.float64)
     out = np.full_like(f, np.inf, dtype=np.float64)
-    m = f > 0
-    out[m] = 22.5 - 2.5 * np.log10(f[m])
+    good = f > 0
+    out[good] = 22.5 - 2.5 * np.log10(f[good])
     return out
 
 
@@ -76,10 +85,14 @@ def parse_keep_circle(s: str) -> Tuple[float, float, float]:
 
 def ellipse_params_from_e1e2(e1: float, e2: float) -> Tuple[float, float]:
     """
-    Convert (e1,e2) to:
-      - axis ratio q = b/a  (clamped)
+    Convert (e1, e2) to:
+      - axis ratio q = b/a
       - position angle theta (radians), measured CCW from +x
-    Using the common definition e = (a-b)/(a+b), with components e1=e cos2θ, e2=e sin2θ.
+
+    Using the common definition:
+      e = (a-b)/(a+b)
+      e1 = e cos(2 theta)
+      e2 = e sin(2 theta)
     """
     e = float(np.hypot(e1, e2))
     e = min(e, 0.95)
@@ -87,6 +100,48 @@ def ellipse_params_from_e1e2(e1: float, e2: float) -> Tuple[float, float]:
     q = float(np.clip(q, 0.05, 1.0))
     theta = 0.5 * float(np.arctan2(e2, e1))
     return q, theta
+
+
+def star_radius_factor(
+    mag: float,
+    maglim: float,
+    mode: str = "linear",
+    alpha: float = 0.5,
+    max_factor: float = 5.0,
+) -> float:
+    """
+    Multiplicative factor for star mask radius.
+
+    For stars near the masking threshold maglim, factor ~ 1.
+    Brighter stars (smaller magnitude) get factor > 1.
+
+    Parameters
+    ----------
+    mag : float
+        Star magnitude.
+    maglim : float
+        Magnitude threshold used for masking.
+    mode : str
+        'linear' or 'flux'
+        - linear: factor = 1 + alpha * max(0, maglim - mag)
+        - flux  : factor = 10**(0.2 * max(0, maglim - mag))
+    alpha : float
+        Linear scaling strength.
+    max_factor : float
+        Maximum allowed multiplicative boost.
+    """
+    dm = max(0.0, float(maglim) - float(mag))
+
+    if mode == "linear":
+        fac = 1.0 + float(alpha) * dm
+    elif mode == "flux":
+        fac = 10.0 ** (0.2 * dm)
+    else:
+        raise ValueError(f"Unknown star radius scaling mode: {mode}")
+
+    fac = max(1.0, fac)
+    fac = min(float(max_factor), fac)
+    return fac
 
 
 def draw_disk(mask: np.ndarray, xc: float, yc: float, r: float, value: int) -> None:
@@ -97,6 +152,7 @@ def draw_disk(mask: np.ndarray, xc: float, yc: float, r: float, value: int) -> N
     y1 = min(int(np.ceil(yc + r)) + 1, ny)
     if x1 <= x0 or y1 <= y0:
         return
+
     yy, xx = np.mgrid[y0:y1, x0:x1]
     rr2 = (xx - xc) ** 2 + (yy - yc) ** 2
     mask[y0:y1, x0:x1][rr2 <= r * r] = value
@@ -112,7 +168,8 @@ def draw_ellipse(
     value: int,
 ) -> None:
     ny, nx = mask.shape
-    # Bounding box radius conservative
+
+    # Conservative bounding-box half-size
     r = max(a, b)
     x0 = max(int(np.floor(xc - r)), 0)
     x1 = min(int(np.ceil(xc + r)) + 1, nx)
@@ -136,6 +193,7 @@ def draw_ellipse(
 
 def main() -> None:
     ap = argparse.ArgumentParser()
+
     ap.add_argument("--image", type=Path, required=True)
     ap.add_argument("--image-hdu", type=int, default=1)
 
@@ -162,22 +220,51 @@ def main() -> None:
         "--maglim",
         type=float,
         default=24.5,
-        help="Mask objects brighter than this (smaller number = brighter).",
+        help="Mask objects brighter than this magnitude.",
     )
 
     ap.add_argument(
         "--star-kfwhm",
         type=float,
         default=3.0,
-        help="Star mask radius = star_kfwhm * FWHM_pix (minimum applies too).",
+        help="Base star radius = star_kfwhm * FWHM_pix (before mag scaling).",
     )
-    ap.add_argument("--star-rmin-pix", type=float, default=3.0)
+    ap.add_argument(
+        "--star-rmin-pix",
+        type=float,
+        default=3.0,
+        help="Minimum base star radius in pixels (before mag scaling).",
+    )
+    ap.add_argument(
+        "--star-mag-scale",
+        choices=["linear", "flux"],
+        default="linear",
+        help=(
+            "How star masks grow for brighter stars. "
+            "'linear' is gentler; 'flux' is more aggressive."
+        ),
+    )
+    ap.add_argument(
+        "--star-mag-alpha",
+        type=float,
+        default=0.5,
+        help=(
+            "Strength of linear brightness scaling. "
+            "Used only if --star-mag-scale=linear."
+        ),
+    )
+    ap.add_argument(
+        "--star-mag-max-factor",
+        type=float,
+        default=5.0,
+        help="Maximum multiplicative radius boost for bright stars.",
+    )
 
     ap.add_argument(
         "--gal-kre",
         type=float,
         default=4.0,
-        help="Galaxy ellipse semi-major a = gal_kre * (shape_r/pixscale) in pixels.",
+        help="Galaxy semi-major axis = gal_kre * (shape_r/pixscale) in pixels.",
     )
     ap.add_argument("--gal-amin-pix", type=float, default=4.0)
 
@@ -192,12 +279,12 @@ def main() -> None:
     only_grp.add_argument(
         "--stars-only",
         action="store_true",
-        help="Mask only PSF (stellar) sources; do not mask extended sources (galaxies).",
+        help="Mask only PSF sources.",
     )
     only_grp.add_argument(
         "--galaxies-only",
         action="store_true",
-        help="Mask only extended sources (galaxies); do not mask PSF (stellar) sources.",
+        help="Mask only extended sources.",
     )
 
     ap.add_argument(
@@ -235,47 +322,62 @@ def main() -> None:
     mag = nanomaggies_to_abmag(tab[flux_col])
     use = np.isfinite(mag) & (mag <= float(args.maglim))
 
-    # World -> pixel (0-index) in the image WCS
+    # World -> pixel in image WCS
     ra = np.asarray(tab["ra"][use], dtype=np.float64)
     dec = np.asarray(tab["dec"][use], dtype=np.float64)
     x, y = wcs.all_world2pix(ra, dec, 0)
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
 
+    # Keep a small boundary margin so near-edge objects still get drawn
     in_im = (x >= -5) & (x < nx + 5) & (y >= -5) & (y < ny + 5)
+
     x = x[in_im]
     y = y[in_im]
-    t = tab["type"][use][in_im]
     mag_use = mag[use][in_im]
+    t = tab["type"][use][in_im]
 
     # Normalize type strings
     def _tostr(v) -> str:
         if isinstance(v, (bytes, np.bytes_)):
-            return v.decode("utf-8", errors="ignore")
-        return str(v)
+            return v.decode("utf-8", errors="ignore").strip()
+        return str(v).strip()
 
     tstr = np.array([_tostr(v) for v in t], dtype=object)
 
+    have_shapes = (
+        ("shape_r" in tab.names)
+        and ("shape_e1" in tab.names)
+        and ("shape_e2" in tab.names)
+    )
+
+    if have_shapes:
+        shape_r_all = np.asarray(tab["shape_r"][use][in_im], dtype=np.float64)
+        shape_e1_all = np.asarray(tab["shape_e1"][use][in_im], dtype=np.float64)
+        shape_e2_all = np.asarray(tab["shape_e2"][use][in_im], dtype=np.float64)
+
     mask = np.zeros((ny, nx), dtype=np.uint8)
 
-    # Pre-parse keep circles
     keep_circles: List[Tuple[float, float, float]] = [
         parse_keep_circle(s) for s in args.keep_circle
     ]
 
-    # Mask sources
+    pixscale = float(args.pixscale_arcsec)
     n_star = 0
     n_gal = 0
-    pixscale = float(args.pixscale_arcsec)
 
-    for xi, yi, ti, mi in zip(x, y, tstr, mag_use):
-        # skip if wildly off-image
-        if xi < -50 or xi > nx + 50 or yi < -50 or yi > ny + 50:
-            continue
-        if ti == "PSF":
-            if args.galaxies_only:
+    # First pass: stars
+    if not args.galaxies_only:
+        is_star = tstr == "PSF"
+        xs = x[is_star]
+        ys = y[is_star]
+        ms = mag_use[is_star]
+
+        for xi, yi, mi in zip(xs, ys, ms):
+            if xi < -50 or xi > nx + 50 or yi < -50 or yi > ny + 50:
                 continue
-            # Star radius from psfsize map if provided; else assume median-ish FWHM=1.3"
+
+            # Star radius from psfsize map if provided; else fallback
             if psf_map is not None:
                 xip = int(np.clip(round(xi), 0, nx - 1))
                 yip = int(np.clip(round(yi), 0, ny - 1))
@@ -286,79 +388,91 @@ def main() -> None:
                 fwhm_arcsec = 1.3
 
             fwhm_pix = fwhm_arcsec / pixscale
-            r = max(float(args.star_rmin_pix), float(args.star_kfwhm) * fwhm_pix)
+            r_base = max(float(args.star_rmin_pix), float(args.star_kfwhm) * fwhm_pix)
 
+            mag_fac = star_radius_factor(
+                mi,
+                args.maglim,
+                mode=args.star_mag_scale,
+                alpha=args.star_mag_alpha,
+                max_factor=args.star_mag_max_factor,
+            )
+
+            r = r_base * mag_fac
             draw_disk(mask, xi, yi, r, int(args.mask_value))
             n_star += 1
-        else:
-            # Ellipse from galaxy shape if available; otherwise fall back to a modest circle.
-            if (
-                ("shape_r" in tab.names)
-                and ("shape_e1" in tab.names)
-                and ("shape_e2" in tab.names)
-            ):
-                # Need the same row values; easiest is to locate via ra/dec match is expensive.
-                # Instead, we approximate by re-reading from the filtered table indices:
-                # For robust use, run with full table indexing; kept simple here by using extra columns in-place.
-                # If these columns are missing for a given ti, they may be 0.
-                pass
 
-            # We can only use shape columns if present in the *filtered* table slice; so rebuild arrays once.
-            # (This is cheap compared to drawing.)
-            # NOTE: The loop will be re-run; keep simple by using precomputed arrays outside the loop in a real pipeline.
-            n_gal += 1
-
-    # Second pass: mask extended sources (unless --stars-only)
+    # Second pass: extended sources
     if not args.stars_only:
         nonpsf = tstr != "PSF"
         xg = x[nonpsf]
         yg = y[nonpsf]
-        n_gal = int(np.count_nonzero(nonpsf))
 
-        have_shapes = (
-            ("shape_r" in tab.names)
-            and ("shape_e1" in tab.names)
-            and ("shape_e2" in tab.names)
-        )
         if have_shapes:
-            shape_r = np.asarray(tab["shape_r"][use][in_im], dtype=np.float64)[nonpsf]
-            shape_e1 = np.asarray(tab["shape_e1"][use][in_im], dtype=np.float64)[nonpsf]
-            shape_e2 = np.asarray(tab["shape_e2"][use][in_im], dtype=np.float64)[nonpsf]
+            rg = shape_r_all[nonpsf]
+            e1g = shape_e1_all[nonpsf]
+            e2g = shape_e2_all[nonpsf]
 
-            for xi, yi, rr, e1, e2 in zip(xg, yg, shape_r, shape_e1, shape_e2):
+            for xi, yi, rr, e1, e2 in zip(xg, yg, rg, e1g, e2g):
+                if xi < -50 or xi > nx + 50 or yi < -50 or yi > ny + 50:
+                    continue
+
                 if not np.isfinite(rr) or rr <= 0:
                     draw_disk(
-                        mask, xi, yi, float(args.gal_amin_pix), int(args.mask_value)
+                        mask,
+                        xi,
+                        yi,
+                        float(args.gal_amin_pix),
+                        int(args.mask_value),
                     )
+                    n_gal += 1
                     continue
+
                 q, theta = ellipse_params_from_e1e2(e1, e2)
                 a = max(float(args.gal_amin_pix), float(args.gal_kre) * (rr / pixscale))
                 b = max(1.0, a * q)
                 draw_ellipse(mask, xi, yi, a, b, theta, int(args.mask_value))
+                n_gal += 1
         else:
-            # No shape columns: fall back to circles for all extended sources
+            # No shape columns: fall back to circles
             rgal = float(args.gal_amin_pix)
             for xi, yi in zip(xg, yg):
+                if xi < -50 or xi > nx + 50 or yi < -50 or yi > ny + 50:
+                    continue
                 draw_disk(mask, xi, yi, rgal, int(args.mask_value))
+                n_gal += 1
 
-    # Apply keep circles: set those pixels back to 0
+    # Apply keep circles by resetting those pixels to 0
     for xc, yc, rc in keep_circles:
-        yy, xx = np.mgrid[0:ny, 0:nx]
+        x0 = max(int(np.floor(xc - rc)), 0)
+        x1 = min(int(np.ceil(xc + rc)) + 1, nx)
+        y0 = max(int(np.floor(yc - rc)), 0)
+        y1 = min(int(np.ceil(yc + rc)) + 1, ny)
+        if x1 <= x0 or y1 <= y0:
+            continue
+
+        yy, xx = np.mgrid[y0:y1, x0:x1]
         sel = (xx - xc) ** 2 + (yy - yc) ** 2 <= rc * rc
-        mask[sel] = 0
+        sub = mask[y0:y1, x0:x1]
+        sub[sel] = 0
 
     # Write FITS
     hdu = fits.PrimaryHDU(data=mask.astype(np.uint8), header=hdr)
     hdu.writeto(args.out_maskbits, overwrite=True)
 
+    masked_pixels = int(np.count_nonzero(mask))
     print(f"Wrote {args.out_maskbits}")
     print(
-        f"Masked pixels: {np.count_nonzero(mask)} / {mask.size} ({100*np.count_nonzero(mask)/mask.size:.2f}%)"
+        f"Masked pixels: {masked_pixels} / {mask.size} "
+        f"({100.0 * masked_pixels / mask.size:.2f}%)"
     )
     if args.stars_only:
         print(f"Stars masked: {n_star} (galaxies skipped)")
-    if args.galaxies_only:
+    elif args.galaxies_only:
         print(f"Galaxies masked: {n_gal} (stars skipped)")
+    else:
+        print(f"Stars masked: {n_star}")
+        print(f"Galaxies masked: {n_gal}")
     print("Note: output is a simple 0/1-style mask; treat any nonzero as masked.")
 
 
