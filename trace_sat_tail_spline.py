@@ -382,8 +382,8 @@ def trace_tail_points_beam(
     step_scales=(0.85, 1.0, 1.15),
     direction_relax=0.10,
     min_move_pix=1.5,
-    turn_penalty=0.5,
-    curvature_penalty=0.5,
+    turn_penalty=2,
+    curvature_penalty=1,
     n_long_bins=8,
     min_bin_frac=0.35,
     mean_weight=0.30,
@@ -1107,15 +1107,6 @@ def main():
     ax.imshow(mu, origin="lower", cmap="gray_r", vmin=vmin, vmax=vmax)
     # ax.contour(component.astype(float), levels=[0.5], colors="cyan", linewidths=0.7)
 
-    if star_mask is not None:
-        ax.contour(
-            star_mask.astype(float),
-            levels=[0.5],
-            colors="red",
-            linewidths=0.5,
-            alpha=0.7,
-        )
-
     if manual_seed_points is not None:
         ax.plot(
             manual_seed_points[:, 0],
@@ -1134,6 +1125,15 @@ def main():
             colors="cyan",
             linewidths=0.7,
             alpha=0.8,
+        )
+
+    if star_mask is not None:
+        ax.contour(
+            star_mask.astype(float),
+            levels=[0.5],
+            colors="red",
+            linewidths=0.5,
+            alpha=0.7,
         )
 
     ax.plot(pts[:, 0], pts[:, 1], "o-", ms=3, lw=1.2, color="yellow", label="trace pts")
