@@ -510,18 +510,24 @@ def _build_master_sigma_from_brick_sigma(
     return master_sigma, fill_sigma
 
 
-def _make_frame_rng(noise_seed, frame_num):
+def _make_frame_rng(noise_seed, frame_num, realization_idx=0):
     """
-    Return a reproducible RNG for a given frame.
+    Return an RNG for a given frame and optional realization index.
 
-    If noise_seed is None, return a fresh non-deterministic RNG.
-    If noise_seed is set, the RNG is deterministic for each frame, so
-    repeated saves of the same frame get identical noise.
+    Behavior:
+      - noise_seed is None:
+          return a fresh non-deterministic RNG each call
+      - noise_seed is set:
+          return a deterministic RNG keyed by
+              (noise_seed, frame_num, realization_idx)
+
+    This lets a single saved image for a frame be reproducible, while also
+    allowing a batch of distinct but reproducible realizations for the same frame.
     """
     if noise_seed is None:
         return np.random.default_rng()
 
-    ss = np.random.SeedSequence([int(noise_seed), int(frame_num)])
+    ss = np.random.SeedSequence([int(noise_seed), int(frame_num), int(realization_idx)])
     return np.random.default_rng(ss)
 
 
@@ -1248,6 +1254,7 @@ def gadget_hdf5_movie(
     brick_pixscale=None,
     brick_invvar=None,
     noise_seed=None,
+    noise_batch_count=100,
     fps=None,
     show_window=True,
     window_size=(1280, 720),
@@ -1511,6 +1518,135 @@ def gadget_hdf5_movie(
 
         return coords_all, counts_all, gid_all, masses_all, m_host_total, m_sat_total
 
+    def _render_current_brick_image(realization_idx=0):
+        """
+        Render the current frame onto the brick grid.
+
+        realization_idx:
+          0   -> the usual single-save realization
+          1..N -> distinct realizations for batch saves
+        """
+        global current_frame
+
+        coords, counts, gid, masses, m_host_total, m_sat_total = _load_luminous_frame(
+            current_frame
+        )
+
+        camera = p.camera
+        rng = _make_frame_rng(
+            noise_seed, current_frame, realization_idx=realization_idx
+        )
+
+        brick_img, _host_img_unused, pixscale, tail_report, render_meta = (
+            _render_shared_outputs(
+                particles=coords,
+                counts=counts,
+                galaxy_id=gid,
+                camera=camera,
+                zp=float(zp),
+                redshift=redshift,
+                cosmo=cosmo,
+                pixel_scale_arcsec=float(brick_pixscale),
+                psf_fwhm_arcsec=float(psf_fwhm) if psf_fwhm is not None else 0.0,
+                noise_std=float(noise_std) if noise_std is not None else 0.0,
+                output_magnitude=bool(mag_out),
+                brick_size=(width_b, height_b),
+                brick_host_xy=host_target_xy,
+                host_size=(host_w, host_h),
+                host_center_xy=host_center_xy,
+                masses=masses,
+                tail_bbox=tail_bbox,
+                m_sat_total_overall=m_sat_total,
+                m_host_total_overall=m_host_total,
+                render_host=True,
+                render_sat=True,
+                brick_sigma_map=brick_sigma_map,
+                rng=rng,
+            )
+        )
+
+        return (
+            brick_img,
+            pixscale,
+            tail_report,
+            render_meta,
+            coords,
+            counts,
+            gid,
+            masses,
+            m_host_total,
+            m_sat_total,
+        )
+
+    def _make_brick_header(pixscale, render_meta, realization_idx=0, batch_count=None):
+        hdr = brick_hdr.copy()
+        hdr["ZP"] = (float(zp), "Zero point magnitude used (nanomaggies convention)")
+        hdr["REDSHFT"] = (float(redshift), "Redshift used for distance modulus")
+        hdr["MLHOST"] = (float(ml_host), "Host M/L_r (solar units)")
+        hdr["MLSAT"] = (float(ml_sat), "Satellite M/L_r (solar units)")
+        hdr["HRA"] = (float(host_ra), "Host RA (deg)")
+        hdr["HDEC"] = (float(host_dec), "Host Dec (deg)")
+        hdr["SRA"] = (float(sat_ra), "Satellite RA (deg)")
+        hdr["SDEC"] = (float(sat_dec), "Satellite Dec (deg)")
+        hdr["PSF_FWHM"] = (
+            float(psf_fwhm) if psf_fwhm is not None else 0.0,
+            "PSF FWHM applied (arcsec)",
+        )
+        hdr["NOISESTD"] = (
+            float(noise_std) if noise_std is not None else 0.0,
+            "Global Gaussian noise sigma if used (nmgy/pix)",
+        )
+        hdr["PIXSCL"] = (float(pixscale), "Pixel scale used in render (arcsec/pix)")
+        hdr["IMAGEW"] = (int(width_b), "Image width (pixels)")
+        hdr["IMAGEH"] = (int(height_b), "Image height (pixels)")
+        hdr["FRAME"] = (int(current_frame), "Snapshot frame rendered")
+        hdr["GIDH"] = (int(host_gid), "Sorted GalaxyID index used as host")
+        hdr["GIDS"] = (int(sat_gid), "Sorted GalaxyID index used as satellite")
+        hdr["GNAMEH"] = (
+            str(gal_names[host_gid]),
+            "GalaxyID_Name for host (from snapshot)",
+        )
+        hdr["GNAMES"] = (
+            str(gal_names[sat_gid]),
+            "GalaxyID_Name for satellite (from snapshot)",
+        )
+
+        hdr["NOISEMOD"] = (
+            str(render_meta.get("noise_mode", "UNKNOWN")),
+            "Noise model: GLOBAL, INVVAR, or NONE",
+        )
+        hdr["NOISESED"] = (
+            int(noise_seed) if noise_seed is not None else -1,
+            "Base random seed for noise; -1 means non-deterministic",
+        )
+        hdr["REALIDX"] = (
+            int(realization_idx),
+            "Noise realization index for this frame",
+        )
+        if batch_count is not None:
+            hdr["BATCHN"] = (
+                int(batch_count),
+                "Number of realizations in the saved batch",
+            )
+
+        if (
+            render_meta.get("noise_mode") == "INVVAR"
+            and render_meta.get("noise_fill_sigma") is not None
+        ):
+            hdr["NFILLSIG"] = (
+                float(render_meta["noise_fill_sigma"]),
+                "Sigma used outside brick footprint (nmgy/pix)",
+            )
+
+        if bool(mag_out):
+            hdr["COMMENT"] = "Synthetic image in mag/arcsec^2 aligned to brick WCS."
+        else:
+            hdr["COMMENT"] = (
+                "Synthetic image in nanomaggies/pixel aligned to brick WCS."
+            )
+
+        return hdr
+
     # 's' key handler: synthesize image aligned to brick and save fits
     def save_surface_brightness():
         global current_frame
@@ -1561,36 +1697,18 @@ def gadget_hdf5_movie(
             )
 
         try:
-            camera = p.camera
-            rng = _make_frame_rng(noise_seed, current_frame)
-            brick_img, _host_img_unused, pixscale, tail_report, render_meta = (
-                _render_shared_outputs(
-                    particles=coords,
-                    counts=counts,
-                    galaxy_id=gid,
-                    camera=camera,
-                    zp=float(zp),
-                    redshift=redshift,
-                    cosmo=cosmo,
-                    pixel_scale_arcsec=float(brick_pixscale),
-                    psf_fwhm_arcsec=float(psf_fwhm) if psf_fwhm is not None else 0.0,
-                    noise_std=float(noise_std) if noise_std is not None else 0.0,
-                    output_magnitude=bool(mag_out),
-                    brick_size=(width_b, height_b),
-                    brick_host_xy=host_target_xy,
-                    host_size=(host_w, host_h),
-                    host_center_xy=host_center_xy,
-                    masses=masses,
-                    tail_bbox=tail_bbox,
-                    m_sat_total_overall=m_sat_total,
-                    m_host_total_overall=m_host_total,
-                    render_host=True,
-                    render_sat=True,
-                    brick_sigma_map=brick_sigma_map,
-                    rng=rng,
-                )
-            )
-            img = brick_img
+            (
+                img,
+                pixscale,
+                tail_report,
+                render_meta,
+                coords,
+                counts,
+                gid,
+                masses,
+                m_host_total,
+                m_sat_total,
+            ) = _render_current_brick_image(realization_idx=0)
         except Exception as e:
             import traceback
 
@@ -1655,61 +1773,12 @@ def gadget_hdf5_movie(
             print("Save cancelled.", file=sys.stderr)
             return
 
-        # Output header: copy brick header so WCS matches exactly
-        hdr = brick_hdr.copy()
-        hdr["ZP"] = (float(zp), "Zero point magnitude used (nanomaggies convention)")
-        hdr["REDSHFT"] = (float(redshift), "Redshift used for distance modulus")
-        hdr["MLHOST"] = (float(ml_host), "Host M/L_r (solar units)")
-        hdr["MLSAT"] = (float(ml_sat), "Satellite M/L_r (solar units)")
-        hdr["HRA"] = (float(host_ra), "Host RA (deg)")
-        hdr["HDEC"] = (float(host_dec), "Host Dec (deg)")
-        hdr["SRA"] = (float(sat_ra), "Satellite RA (deg)")
-        hdr["SDEC"] = (float(sat_dec), "Satellite Dec (deg)")
-        hdr["PSF_FWHM"] = (
-            float(psf_fwhm) if psf_fwhm is not None else 0.0,
-            "PSF FWHM applied (arcsec)",
+        hdr = _make_brick_header(
+            pixscale=pixscale,
+            render_meta=render_meta,
+            realization_idx=0,
+            batch_count=None,
         )
-        hdr["NOISESTD"] = (
-            float(noise_std) if noise_std is not None else 0.0,
-            "Gaussian noise sigma added (output units)",
-        )
-        hdr["PIXSCL"] = (float(pixscale), "Pixel scale used in render (arcsec/pix)")
-        hdr["IMAGEW"] = (int(width_b), "Image width (pixels)")
-        hdr["IMAGEH"] = (int(height_b), "Image height (pixels)")
-        hdr["FRAME"] = (int(current_frame), "Snapshot frame rendered")
-        hdr["GIDH"] = (int(host_gid), "Sorted GalaxyID index used as host")
-        hdr["GIDS"] = (int(sat_gid), "Sorted GalaxyID index used as satellite")
-        hdr["NOISEMOD"] = (
-            str(render_meta.get("noise_mode", "UNKNOWN")),
-            "Noise model: GLOBAL, INVVAR, or NONE",
-        )
-        hdr["NOISESED"] = (
-            int(noise_seed) if noise_seed is not None else -1,
-            "Base random seed for noise; -1 means non-deterministic",
-        )
-        if (
-            render_meta.get("noise_mode") == "INVVAR"
-            and render_meta.get("noise_fill_sigma") is not None
-        ):
-            hdr["NFILLSIG"] = (
-                float(render_meta["noise_fill_sigma"]),
-                "Sigma used outside brick footprint (nmgy/pix)",
-            )
-        hdr["GNAMEH"] = (
-            str(gal_names[host_gid]),
-            "GalaxyID_Name for host (from snapshot)",
-        )
-        hdr["GNAMES"] = (
-            str(gal_names[sat_gid]),
-            "GalaxyID_Name for satellite (from snapshot)",
-        )
-
-        if bool(mag_out):
-            hdr["COMMENT"] = "Synthetic image in mag/arcsec^2 aligned to brick WCS."
-        else:
-            hdr["COMMENT"] = (
-                "Synthetic image in nanomaggies/pixel aligned to brick WCS."
-            )
 
         hdu = fits.PrimaryHDU(np.asarray(img, dtype=np.float32), header=hdr)
         try:
@@ -1718,7 +1787,96 @@ def gadget_hdf5_movie(
         except Exception as e:
             print(f"[Error] Failed to write FITS file: {e}", file=sys.stderr)
 
+    def save_noise_realization_batch():
+        """
+        Save multiple simulated brick images for the current frame:
+            s1.fits, s2.fits, ..., sN.fits
+
+        If noise_seed is None, each image gets a fresh random realization.
+        If noise_seed is set, the realizations are distinct but reproducible.
+        """
+        global current_frame
+
+        batch_count = int(noise_batch_count)
+        if batch_count <= 0:
+            print(
+                f"[BatchSave] noise_batch_count must be positive; got {batch_count}",
+                file=sys.stderr,
+            )
+            return
+
+        # Ask for output directory
+        out_dir = None
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            folder = filedialog.askdirectory(
+                title=f"Choose folder for {batch_count} simulated brick images"
+            )
+            root.destroy()
+            if folder:
+                out_dir = Path(folder).expanduser()
+        except Exception:
+            typed = input("Enter output folder for batch FITS files: ").strip()
+            if typed:
+                out_dir = Path(typed).expanduser()
+
+        if out_dir is None:
+            print("Batch save cancelled.", file=sys.stderr)
+            return
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        print(
+            f"[BatchSave] Saving {batch_count} simulated brick images for frame "
+            f"{current_frame} into {out_dir}"
+        )
+
+        for i in range(1, batch_count + 1):
+            try:
+                (
+                    img,
+                    pixscale,
+                    tail_report,
+                    render_meta,
+                    coords,
+                    counts,
+                    gid,
+                    masses,
+                    m_host_total,
+                    m_sat_total,
+                ) = _render_current_brick_image(realization_idx=i)
+
+                hdr = _make_brick_header(
+                    pixscale=pixscale,
+                    render_meta=render_meta,
+                    realization_idx=i,
+                    batch_count=batch_count,
+                )
+
+                filename = out_dir / f"s{i}.fits"
+                fits.PrimaryHDU(
+                    np.asarray(img, dtype=np.float32),
+                    header=hdr,
+                ).writeto(filename, overwrite=True)
+
+                if i == 1 or i % 10 == 0 or i == batch_count:
+                    print(f"[BatchSave] Wrote {filename.name}")
+
+            except Exception as e:
+                import traceback
+
+                print(traceback.format_exc())
+                print(
+                    f"[BatchSave] Failed on realization {i}: {e}",
+                    file=sys.stderr,
+                )
+                return
+
+        print(f"[BatchSave] Done. Wrote {batch_count} files to {out_dir}")
+
     p.add_key_event("s", save_surface_brightness)
+    p.add_key_event("n", save_noise_realization_batch)
 
     host_w, host_h = map(int, host_image_size)
     host_center_xy = ((host_w - 1) / 2.0, (host_h - 1) / 2.0)
@@ -2150,6 +2308,15 @@ def main():
         ),
     )
     parser.add_argument(
+        "--noise-batch-count",
+        type=int,
+        default=100,
+        help=(
+            "Number of simulated brick images to save when pressing the 'n' key. "
+            "Default: 100"
+        ),
+    )
+    parser.add_argument(
         "--psf", type=float, default=0.0, help="PSF FWHM to convolve (arcsec)"
     )
     parser.add_argument(
@@ -2258,6 +2425,7 @@ def main():
         brick_pixscale=brick_pixscale,
         brick_invvar=brick_invvar,
         noise_seed=args.noise_seed,
+        noise_batch_count=args.noise_batch_count,
         fps=args.fps,
         show_window=show_window,
         window_size=tuple(args.window_size),
