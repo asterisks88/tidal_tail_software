@@ -18,6 +18,7 @@ from scipy.integrate import simpson
 
 image_scale = 0.262 / 60.0  # Legacy Survey Scale arcmin/px
 wcs_obj = None  # set when a FITS is loaded
+overlay_points = []
 contour_artists = []  # lines we draw, so we can clear them later
 sx_am = image_scale
 sy_am = image_scale
@@ -27,14 +28,16 @@ contrast_factor = 1.0  # Initial contrast level
 image_data = None
 fits_file = None
 
+overlay_visible = False
 move_mode = False  # False = add points, True = move existing points
 dragging_idx = None  # index of point currently being dragged
 spline_visible = False  # once Draw Spline is called, keep showing it
+show_control_points = True
 pick_radius_px = 10
 
 # Create blank figure and axes
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 
 fig, ax = plt.subplots()
 startup_text = ax.text(
@@ -85,18 +88,18 @@ def _current_display_image():
     return adjusted
 
 
-def _compute_spline():
+def _compute_spline_from_points(pts):
     """
     Returns x_spline, y_spline, length_arcmin
     or (None, None, None) if not enough valid points.
     """
-    if len(points) < 2:
+    if len(pts) < 2:
         return None, None, None
 
-    x = np.array([p[0] for p in points], dtype=float)
-    y = np.array([p[1] for p in points], dtype=float)
+    x = np.array([p[0] for p in pts], dtype=float)
+    y = np.array([p[1] for p in pts], dtype=float)
 
-    # Remove consecutive duplicate points so CubicSpline won't choke on zero spacing
+    # Remove consecutive duplicate points
     keep = np.ones(len(x), dtype=bool)
     if len(x) > 1:
         keep[1:] = np.hypot(np.diff(x), np.diff(y)) > 1e-9
@@ -120,7 +123,6 @@ def _compute_spline():
         x_spline = spline_x(t_fine)
         y_spline = spline_y(t_fine)
 
-    # Length in arcmin, using possibly different X/Y pixel scales
     dx = np.diff(x_spline) * sx_am
     dy = np.diff(y_spline) * sy_am
     length_arcmin = np.sum(np.hypot(dx, dy))
@@ -128,15 +130,67 @@ def _compute_spline():
     return x_spline, y_spline, length_arcmin
 
 
+def _compute_spline():
+    return _compute_spline_from_points(points)
+
+
 def update_window_title():
     fname = os.path.basename(fits_file) if fits_file else "No file loaded"
     mode = "MOVE" if move_mode else "ADD"
-    manager.set_window_title(f"FITS Viewer - {fname} [{mode} mode]")
+    pts = "PTS ON" if show_control_points else "PTS OFF"
+    manager.set_window_title(f"FITS Viewer - {fname} [{mode} mode | {pts}]")
+
+
+def _draw_spline_from_points(
+    pts,
+    *,
+    line_color,
+    line_style,
+    halo_color,
+    label_prefix,
+    label_offset=(15, 0),
+    marker=None,
+    markevery=None,
+):
+    x_spline, y_spline, length_arcmin = _compute_spline_from_points(pts)
+    if x_spline is None:
+        return
+
+    (line,) = ax.plot(
+        x_spline,
+        y_spline,
+        color=line_color,
+        lw=2.3,
+        linestyle=line_style,
+        zorder=4,
+        marker=marker,
+        markevery=markevery,
+        ms=4,
+        mfc="none",
+        mec=line_color,
+    )
+    line.set_path_effects(
+        [pe.Stroke(linewidth=4.8, foreground=halo_color, alpha=0.85), pe.Normal()]
+    )
+
+    dx_lab, dy_lab = label_offset
+    label = ax.text(
+        x_spline[-1] + dx_lab,
+        y_spline[-1] + dy_lab,
+        f"{label_prefix}: {length_arcmin:.2f}'",
+        color=line_color,
+        fontsize=13,
+        weight="bold",
+        zorder=6,
+    )
+    label.set_path_effects(
+        [pe.withStroke(linewidth=6.0, foreground="black", alpha=0.75), pe.Normal()]
+    )
 
 
 def render_scene(preserve_limits=True, highlight_idx=None):
     """
-    Redraw image, points, spline, and length label.
+    Redraw image, points, spline(s), and length label(s).
     """
     if image_data is None:
         return
@@ -150,37 +204,66 @@ def render_scene(preserve_limits=True, highlight_idx=None):
     )
     _apply_axes_formatting()
 
-    # Draw spline if enabled
+    # Primary spline: editable/current
     if spline_visible and len(points) > 1:
-        x_spline, y_spline, length_arcmin = _compute_spline()
-        if x_spline is not None:
-            ax.plot(x_spline, y_spline, color="b", lw=1.0)
+        _draw_spline_from_points(
+            points,
+            line_color="deepskyblue",
+            line_style="-",
+            halo_color="black",
+            label_prefix="S1",
+            label_offset=(15, 0),
+            marker=None,
+            markevery=None,
+        )
 
-            length_label = ax.text(
-                x_spline[-1] + 15,
-                y_spline[-1],
-                f"{length_arcmin:.2f}'",
-                color="black",
-                fontsize=16,
-                weight="bold",
-                zorder=5,
-            )
-            length_label.set_path_effects(
-                [
-                    pe.withStroke(linewidth=10.0, foreground="white", alpha=0.8),
-                    pe.Normal(),
-                ]
-            )
+    # Secondary spline: comparison overlay
+    if overlay_visible and len(overlay_points) > 1:
+        _draw_spline_from_points(
+            overlay_points,
+            line_color="gold",
+            line_style=(0, (8, 3, 1.5, 3)),
+            halo_color="black",
+            label_prefix="S2",
+            label_offset=(15, -18),
+            marker="s",
+            markevery=55,
+        )
 
-    # Draw control points
-    if len(points) > 0:
+    # Draw control points only if enabled
+    if show_control_points and len(points) > 0:
         xp = [p[0] for p in points]
         yp = [p[1] for p in points]
-        ax.plot(xp, yp, "ro", ms=6, linestyle="None")
+        ax.plot(
+            xp,
+            yp,
+            marker="o",
+            ms=6,
+            linestyle="None",
+            mfc="none",
+            mec="deepskyblue",
+            mew=1.5,
+            zorder=7,
+        )
 
         if highlight_idx is not None and 0 <= highlight_idx < len(points):
             hx, hy = points[highlight_idx]
-            ax.plot(hx, hy, marker="o", ms=10, mfc="none", mec="cyan", mew=2)
+            ax.plot(hx, hy, marker="o", ms=10, mfc="none", mec="cyan", mew=2, zorder=8)
+
+    if show_control_points and len(overlay_points) > 0:
+        xo = [p[0] for p in overlay_points]
+        yo = [p[1] for p in overlay_points]
+        ax.plot(
+            xo,
+            yo,
+            marker="s",
+            ms=6,
+            linestyle="None",
+            mfc="none",
+            mec="gold",
+            mew=1.5,
+            zorder=7,
+        )
 
     if xlim is not None and ylim is not None:
         ax.set_xlim(xlim)
@@ -214,6 +297,13 @@ def set_move_mode(enabled):
 
 def toggle_move_mode():
     set_move_mode(not move_mode)
+
+
+def toggle_control_points():
+    global show_control_points
+    show_control_points = not show_control_points
+    update_window_title()
+    render_scene()
 
 
 def set_centered_arcmin_ticks(
@@ -586,9 +676,110 @@ def open_file():
         load_fits(selected_file)
 
 
+def _read_points_csv(csv_file):
+    import csv
+
+    new_points = []
+
+    with open(csv_file, "r", newline="") as csvfile:
+        reader = csv.reader(csvfile)
+
+        first_row = next(reader, None)
+        if first_row is None:
+            raise RuntimeError("CSV file is empty.")
+
+        def parse_xy(row):
+            if len(row) < 2:
+                raise RuntimeError(f"Bad row: {row}")
+            return float(row[0]), float(row[1])
+
+        try:
+            new_points.append(parse_xy(first_row))
+        except Exception:
+            h0 = first_row[0].strip().lower() if len(first_row) > 0 else ""
+            h1 = first_row[1].strip().lower() if len(first_row) > 1 else ""
+            if not ((h0 == "x" and h1 == "y") or (h0 == "x_pix" and h1 == "y_pix")):
+                raise RuntimeError(
+                    "First row is neither numeric data nor a valid x,y header."
+                )
+
+        for row in reader:
+            if not row or all(str(v).strip() == "" for v in row):
+                continue
+            new_points.append(parse_xy(row))
+
+    if len(new_points) == 0:
+        raise RuntimeError("No valid spline points found in CSV.")
+
+    return new_points
+
+
+def _choose_spline_csv(title):
+    root = tk.Toplevel()
+    root.withdraw()
+    csv_file = filedialog.askopenfilename(
+        parent=root,
+        title=title,
+        filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+    )
+    root.destroy()
+
+    if not csv_file:
+        return None, None
+
+    return _read_points_csv(csv_file), csv_file
+
+
+def load_points():
+    global points, spline_visible, dragging_idx
+
+    if image_data is None:
+        messagebox.showerror("Load Spline 1 CSV", "Load a FITS image first.")
+        return
+
+    try:
+        new_points, csv_file = _choose_spline_csv("Load spline 1 CSV")
+        if new_points is None:
+            return
+
+        points[:] = new_points
+        dragging_idx = None
+        spline_visible = len(points) > 1
+        render_scene()
+
+        messagebox.showinfo(
+            "Load Spline 1 CSV",
+            f"Loaded {len(points)} control points from:\n{os.path.basename(csv_file)}",
+        )
+    except Exception as e:
+        messagebox.showerror("Load Spline 1 CSV", f"Failed to load spline:\n{e}")
+
+
+def load_overlay_points():
+    global overlay_points, overlay_visible
+
+    if image_data is None:
+        messagebox.showerror("Load Spline 2 CSV", "Load a FITS image first.")
+        return
+
+    try:
+        new_points, csv_file = _choose_spline_csv("Load spline 2 CSV")
+        if new_points is None:
+            return
+
+        overlay_points[:] = new_points
+        overlay_visible = len(overlay_points) > 1
+        render_scene()
+
+        messagebox.showinfo(
+            "Load Spline 2 CSV",
+            f"Loaded {len(overlay_points)} control points from:\n{os.path.basename(csv_file)}",
+        )
+    except Exception as e:
+        messagebox.showerror("Load Spline 2 CSV", f"Failed to load spline:\n{e}")
+
+
 # Function to save points to CSV
-
-
 def save_points():
     import csv
 
@@ -618,6 +809,17 @@ def save_points():
     )
 
 
+def clear_points():
+    global dragging_idx, spline_visible, overlay_visible
+
+    points.clear()
+    overlay_points.clear()
+    dragging_idx = None
+    spline_visible = False
+    overlay_visible = False
+    render_scene()
+
+
 def draw_spline():
     global spline_visible
     spline_visible = True
@@ -631,11 +833,13 @@ import tkinter.ttk as ttk  # Make sure this is imported at the top
 def load_fits(selected_file):
     import json
 
-    global galaxy_group, points, contrast_factor, fits_file, image_data, image_scale, startup_text, sx_am, sy_am, spline_visible
+    global galaxy_group, points, contrast_factor, fits_file, image_data, image_scale, startup_text, sx_am, sy_am, spline_visible, overlay_points, overlay_visible
     contrast_factor = 1.0
-    spline_visible = False
-
     points.clear()
+    overlay_points.clear()
+    spline_visible = False
+    overlay_visible = False
+
     ax.clear()
 
     # Show 'Loading...' text
@@ -677,7 +881,6 @@ def load_fits(selected_file):
 menu_bar = tk.Menu(manager.window)
 file_menu = tk.Menu(menu_bar, tearoff=0)
 file_menu.add_command(label="Open", accelerator="Ctrl+O", command=open_file)
-file_menu.add_command(label="Save Points", accelerator="Ctrl+S", command=save_points)
 file_menu.add_command(
     label="Save PNG (overlays)", accelerator="Ctrl+P", command=save_png_same_size
 )
@@ -688,7 +891,14 @@ menu_bar.add_cascade(label="File", menu=file_menu)
 spline_menu = tk.Menu(menu_bar, tearoff=0)
 spline_menu.add_command(label="Draw Spline", accelerator="Ctrl+D", command=draw_spline)
 spline_menu.add_command(
-    label="Clear Points", accelerator="Ctrl+C", command=lambda: clear_points()
+    label="Load Spline 1 CSV", accelerator="Ctrl+I", command=load_points
+)
+spline_menu.add_command(label="Load Spline 2 CSV", command=load_overlay_points)
+spline_menu.add_command(
+    label="Save Spline 1 CSV", accelerator="Ctrl+S", command=save_points
+)
+spline_menu.add_command(
+    label="Clear All Splines", accelerator="Ctrl+C", command=clear_points
 )
 spline_menu.add_separator()
 spline_menu.add_command(
@@ -697,7 +907,11 @@ spline_menu.add_command(
 spline_menu.add_command(
     label="Move Point Mode", accelerator="M", command=lambda: set_move_mode(True)
 )
+spline_menu.add_command(
+    label="Toggle Control Points", accelerator="T", command=toggle_control_points
+)
 menu_bar.add_cascade(label="Spline", menu=spline_menu)
+
 # Overlays menu
 over_menu = tk.Menu(menu_bar, tearoff=0)
 over_menu.add_command(
@@ -720,6 +934,8 @@ manager.window.config(menu=menu_bar)
 
 # Bind Ctrl+O
 manager.window.bind_all("<Control-o>", lambda event: open_file())
+# Bind Ctrl+L
+manager.window.bind_all("<Control-l>", lambda event: load_points())
 # Bind Ctrl+S
 manager.window.bind_all("<Control-s>", lambda event: save_points())
 # Bind Ctrl+Q
@@ -732,8 +948,8 @@ manager.window.bind_all("<Control-d>", lambda event: draw_spline())
 manager.window.bind_all("<Control-c>", lambda event: clear_points())
 # Bind Ctrl+R
 manager.window.bind_all("<Control-r>", lambda event: reset_contrast())
-# Bind Ctrl+L
-manager.window.bind_all("<Control-l>", lambda event: load_and_draw_ds9_contours())
+# Bind Ctrl+T
+manager.window.bind_all("<Control-t>", lambda event: load_and_draw_ds9_contours())
 # Bind Ctrl+Shift+Z
 manager.window.bind_all("<Control-Shift-Z>", lambda event: zoom_to_points())
 
@@ -745,11 +961,6 @@ def reset_contrast():
 
 
 def update_contrast():
-    render_scene()
-
-
-def clear_points():
-    points.clear()
     render_scene()
 
 
@@ -834,6 +1045,9 @@ def onkey(event):
 
     elif event.key == "c":
         clear_points()
+
+    elif event.key == "t":
+        toggle_control_points()
 
 
 def _on_xlim_changed(_ax):
