@@ -2,9 +2,12 @@
 
 import argparse
 import csv
-from pathlib import Path
 
 import numpy as np
+from astropy import units as u
+from astropy.cosmology import Planck18
+
+LEGACY_PIXSCALE_ARCSEC = 0.262
 
 
 def load_xy_csv(path, x_col=0, y_col=1):
@@ -156,6 +159,69 @@ def cumulative_turning_from_normalized_curvature(kappa_norm):
     return theta
 
 
+def build_profile(points):
+    L = curve_length(points)
+    s = cumulative_arclength(points)
+    kappa = compute_curvature(points, s)
+    kappa_norm = kappa * L
+    theta = cumulative_turning_from_normalized_curvature(kappa_norm)
+
+    return {
+        "points": points,
+        "s": s,
+        "length": L,
+        "kappa": kappa,
+        "kappa_abs": np.abs(kappa),
+        "kappa_norm": kappa_norm,
+        "kappa_norm_abs": np.abs(kappa_norm),
+        "theta": theta,
+    }
+
+
+def unit_tangent_and_normal(points, s):
+    x = points[:, 0]
+    y = points[:, 1]
+
+    dx = np.gradient(x, s)
+    dy = np.gradient(y, s)
+
+    speed = np.hypot(dx, dy)
+    eps = 1e-14
+    tx = dx / np.maximum(speed, eps)
+    ty = dy / np.maximum(speed, eps)
+
+    tangent = np.column_stack((tx, ty))
+    normal = np.column_stack((-ty, tx))
+    return tangent, normal
+
+
+def compute_residual_profile(points_ref, points_cmp):
+    """
+    Residuals of comparison curve relative to the reference curve,
+    evaluated point-by-point at matched fractional arc length.
+    """
+    s_ref = cumulative_arclength(points_ref)
+    tangent, normal = unit_tangent_and_normal(points_ref, s_ref)
+
+    delta = points_cmp - points_ref
+    along_track = np.sum(delta * tangent, axis=1)
+    cross_track = np.sum(delta * normal, axis=1)
+    separation = np.linalg.norm(delta, axis=1)
+
+    return {
+        "s_pixels": s_ref,
+        "along_track_pixels": along_track,
+        "cross_track_pixels": cross_track,
+        "separation_pixels": separation,
+        "along_track_rmse_pixels": rmse(along_track, np.zeros_like(along_track)),
+        "cross_track_rmse_pixels": rmse(cross_track, np.zeros_like(cross_track)),
+        "separation_rmse_pixels": rmse(separation, np.zeros_like(separation)),
+        "separation_mean_pixels": float(np.mean(separation)),
+        "separation_median_pixels": float(np.median(separation)),
+        "separation_max_pixels": float(np.max(separation)),
+    }
+
+
 def compare_curvature_profiles(points_a, points_b):
     """
     Compare two curves by curvature profile after both have been:
@@ -164,36 +230,18 @@ def compare_curvature_profiles(points_a, points_b):
 
     Returns metrics for best of forward/reversed ordering of curve B.
     """
-
-    def make_profiles(points):
-        L = curve_length(points)
-        s = cumulative_arclength(points)
-        kappa = compute_curvature(points, s)
-
-        # Dimensionless curvature profile: shape-focused, scale-reduced
-        kappa_norm = kappa * L
-
-        theta = cumulative_turning_from_normalized_curvature(kappa_norm)
-
-        return {
-            "length": L,
-            "kappa": kappa,
-            "kappa_abs": np.abs(kappa),
-            "kappa_norm": kappa_norm,
-            "kappa_norm_abs": np.abs(kappa_norm),
-            "theta": theta,
-        }
-
-    prof_a = make_profiles(points_a)
+    prof_a = build_profile(points_a)
 
     candidates = []
 
     # Forward
-    prof_b_fwd = make_profiles(points_b)
-    candidates.append(("forward", prof_b_fwd))
+    points_b_fwd = points_b.copy()
+    prof_b_fwd = build_profile(points_b_fwd)
+    candidates.append(("forward", points_b_fwd, prof_b_fwd))
 
     # Reversed
-    prof_b_rev = make_profiles(points_b[::-1].copy())
+    points_b_rev = points_b[::-1].copy()
+    prof_b_rev = build_profile(points_b_rev)
 
     # For a reversed traversal of the same geometric curve,
     # signed curvature changes sign. Flip it back so that
@@ -202,11 +250,13 @@ def compare_curvature_profiles(points_a, points_b):
     prof_b_rev["kappa_norm"] *= -1.0
     prof_b_rev["theta"] *= -1.0
 
-    candidates.append(("reversed", prof_b_rev))
+    candidates.append(("reversed", points_b_rev, prof_b_rev))
 
     best = None
 
-    for direction, prof_b in candidates:
+    for direction, points_b_used, prof_b in candidates:
+        residuals = compute_residual_profile(prof_a["points"], points_b_used)
+
         result = {
             "direction_used": direction,
             "length_a": prof_a["length"],
@@ -227,6 +277,7 @@ def compare_curvature_profiles(points_a, points_b):
             "total_turning_b_rad": float(prof_b["theta"][-1]),
             "profiles_a": prof_a,
             "profiles_b": prof_b,
+            "residuals": residuals,
         }
 
         # Heuristic combined score in [0,1]-ish, higher is better.
@@ -251,7 +302,84 @@ def compare_curvature_profiles(points_a, points_b):
     return best
 
 
-def print_report(result, file_a, file_b, n_samples, smooth_sigma):
+def make_scale_info(z=None, pixscale_arcsec=LEGACY_PIXSCALE_ARCSEC):
+    arcsec_per_pixel = pixscale_arcsec * u.arcsec
+    arcmin_per_pixel = arcsec_per_pixel.to(u.arcmin)
+
+    info = {
+        "pixscale_arcsec": pixscale_arcsec,
+        "arcsec_per_pixel": arcsec_per_pixel,
+        "arcmin_per_pixel": arcmin_per_pixel,
+        "z": z,
+        "has_cosmology": z is not None,
+    }
+
+    if z is not None:
+        if z < 0:
+            raise ValueError("z must be >= 0")
+        da = Planck18.angular_diameter_distance(z)
+        kpc_per_arcmin = Planck18.kpc_proper_per_arcmin(z)
+        kpc_per_pixel = (kpc_per_arcmin * arcmin_per_pixel).to(u.kpc)
+
+        info.update(
+            {
+                "angular_diameter_distance": da,
+                "kpc_per_arcmin": kpc_per_arcmin,
+                "kpc_per_pixel": kpc_per_pixel,
+            }
+        )
+
+    return info
+
+
+def length_summary(length_pixels, scale_info):
+    out = {
+        "pixels": float(length_pixels),
+        "arcsec": (length_pixels * scale_info["arcsec_per_pixel"]).to_value(u.arcsec),
+        "arcmin": (length_pixels * scale_info["arcmin_per_pixel"]).to_value(u.arcmin),
+    }
+    if scale_info["has_cosmology"]:
+        out["kpc"] = (length_pixels * scale_info["kpc_per_pixel"]).to_value(u.kpc)
+    return out
+
+
+def convert_profile_pixels_to_display(values_pixels, scale_info):
+    values_pixels = np.asarray(values_pixels, dtype=float)
+
+    if scale_info["has_cosmology"]:
+        return (
+            values_pixels * scale_info["kpc_per_pixel"].to_value(u.kpc),
+            "kpc",
+        )
+
+    return (
+        values_pixels * scale_info["arcsec_per_pixel"].to_value(u.arcsec),
+        "arcsec",
+    )
+
+
+def print_length_block(label, summary):
+    print(f"{label}")
+    print(f"  pixels                  : {summary['pixels']:.6g}")
+    print(f"  arcsec                  : {summary['arcsec']:.6g}")
+    print(f"  arcmin                  : {summary['arcmin']:.6g}")
+    if "kpc" in summary:
+        print(f"  proper length (kpc)     : {summary['kpc']:.6g}")
+
+
+def print_report(
+    result,
+    file_a,
+    file_b,
+    n_samples,
+    smooth_sigma,
+    raw_length_a,
+    raw_length_b,
+    scale_info,
+):
+    length_a = length_summary(raw_length_a, scale_info)
+    length_b = length_summary(raw_length_b, scale_info)
+
     print("Curvature-based spline comparison")
     print("--------------------------------")
     print(f"file A                    : {file_a}")
@@ -259,11 +387,34 @@ def print_report(result, file_a, file_b, n_samples, smooth_sigma):
     print(f"resampled points          : {n_samples}")
     print(f"smoothing sigma (samples) : {smooth_sigma}")
     print(f"direction_used            : {result['direction_used']}")
+    print(
+        f"pixel scale               : {scale_info['pixscale_arcsec']:.6g} arcsec/pixel"
+    )
+    if scale_info["has_cosmology"]:
+        print(f"redshift z                : {scale_info['z']:.6g}")
+        print(
+            "angular diameter distance : "
+            f"{scale_info['angular_diameter_distance'].to_value(u.Mpc):.6g} Mpc"
+        )
+        print(
+            "proper scale              : "
+            f"{scale_info['kpc_per_arcmin'].to_value(u.kpc / u.arcmin):.6g} kpc/arcmin"
+        )
     print()
-    print(f"length A                  : {result['length_a']:.6g}")
-    print(f"length B                  : {result['length_b']:.6g}")
-    print(f"length ratio B/A          : {result['length_ratio_b_over_a']:.6g}")
+
+    print_length_block("Input spline length A", length_a)
+    print_length_block("Input spline length B", length_b)
+    print(f"  raw length ratio B/A    : {raw_length_b / raw_length_a:.6g}")
     print()
+
+    residuals = result["residuals"]
+    cross_vals, cross_unit = convert_profile_pixels_to_display(
+        residuals["cross_track_pixels"], scale_info
+    )
+    sep_vals, sep_unit = convert_profile_pixels_to_display(
+        residuals["separation_pixels"], scale_info
+    )
+
     print(f"signed curvature RMSE     : {result['signed_curvature_rmse']:.6g}")
     print(f"abs curvature RMSE        : {result['abs_curvature_rmse']:.6g}")
     print(f"signed curvature corr     : {result['signed_curvature_corr']:.6f}")
@@ -272,58 +423,63 @@ def print_report(result, file_a, file_b, n_samples, smooth_sigma):
     print(f"total turning A (rad)     : {result['total_turning_a_rad']:.6g}")
     print(f"total turning B (rad)     : {result['total_turning_b_rad']:.6g}")
     print(f"shape similarity score    : {result['shape_similarity_score']:.6f}")
+    print()
+    print(
+        f"cross-track RMSE ({cross_unit}) : {rmse(cross_vals, np.zeros_like(cross_vals)):.6g}"
+    )
+    print(f"mean residual ({sep_unit})      : {np.mean(sep_vals):.6g}")
+    print(f"median residual ({sep_unit})    : {np.median(sep_vals):.6g}")
+    print(f"max residual ({sep_unit})       : {np.max(sep_vals):.6g}")
 
 
-def maybe_plot(result, outpath=None):
+def maybe_plot(result, scale_info, outpath=None):
     import matplotlib.pyplot as plt
 
-    prof_a = result["profiles_a"]
-    prof_b = result["profiles_b"]
+    residuals = result["residuals"]
 
-    n = len(prof_a["kappa_norm"])
-    u = np.linspace(0.0, 1.0, n)
+    s_disp, s_unit = convert_profile_pixels_to_display(
+        residuals["s_pixels"], scale_info
+    )
+    cross_disp, y_unit = convert_profile_pixels_to_display(
+        residuals["cross_track_pixels"], scale_info
+    )
+    sep_disp, _ = convert_profile_pixels_to_display(
+        residuals["separation_pixels"], scale_info
+    )
 
-    fig = plt.figure(figsize=(12, 10))
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
 
-    ax1 = fig.add_subplot(2, 2, 1)
-    ax1.plot(u, prof_a["kappa_norm"], label="A")
-    ax1.plot(u, prof_b["kappa_norm"], label="B")
-    ax1.set_title("Signed normalized curvature")
-    ax1.set_xlabel("Normalized arc length")
-    ax1.set_ylabel("kappa * L")
-    ax1.legend()
+    ax1.plot(s_disp, cross_disp)
+    ax1.axhline(0.0, linewidth=1.0, linestyle="--")
+    ax1.set_ylabel(f"Cross-track offset [{y_unit}]")
+    ax1.set_title("Spline residuals at matched fractional arc length")
 
-    ax2 = fig.add_subplot(2, 2, 2)
-    ax2.plot(u, prof_a["kappa_norm_abs"], label="A")
-    ax2.plot(u, prof_b["kappa_norm_abs"], label="B")
-    ax2.set_title("Absolute normalized curvature")
-    ax2.set_xlabel("Normalized arc length")
-    ax2.set_ylabel("|kappa| * L")
-    ax2.legend()
+    ax2.plot(s_disp, sep_disp)
+    ax2.set_xlabel(f"Arc length along spline A [{s_unit}]")
+    ax2.set_ylabel(f"Residual offset [{y_unit}]")
 
-    ax3 = fig.add_subplot(2, 2, 3)
-    ax3.plot(u, prof_a["theta"], label="A")
-    ax3.plot(u, prof_b["theta"], label="B")
-    ax3.set_title("Cumulative turning angle")
-    ax3.set_xlabel("Normalized arc length")
-    ax3.set_ylabel("Theta(u) [rad]")
-    ax3.legend()
-
-    ax4 = fig.add_subplot(2, 2, 4)
-    ax4.axis("off")
-    txt = "\n".join(
+    text = "\n".join(
         [
             f"direction_used = {result['direction_used']}",
-            f"length_ratio B/A = {result['length_ratio_b_over_a']:.6g}",
-            f"signed curvature RMSE = {result['signed_curvature_rmse']:.6g}",
-            f"abs curvature RMSE = {result['abs_curvature_rmse']:.6g}",
-            f"signed curvature corr = {result['signed_curvature_corr']:.6f}",
-            f"abs curvature corr = {result['abs_curvature_corr']:.6f}",
-            f"turning angle RMSE = {result['turning_angle_rmse']:.6g}",
             f"shape similarity score = {result['shape_similarity_score']:.6f}",
+            (
+                f"cross-track RMSE [{y_unit}] = "
+                f"{rmse(cross_disp, np.zeros_like(cross_disp)):.6g}"
+            ),
+            f"mean residual [{y_unit}] = {np.mean(sep_disp):.6g}",
+            f"max residual [{y_unit}] = {np.max(sep_disp):.6g}",
         ]
     )
-    ax4.text(0.01, 0.99, txt, va="top", ha="left", family="monospace")
+    ax1.text(
+        0.99,
+        0.97,
+        text,
+        transform=ax1.transAxes,
+        ha="right",
+        va="top",
+        family="monospace",
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85},
+    )
 
     plt.tight_layout()
 
@@ -355,16 +511,32 @@ def main():
         help="Gaussian smoothing sigma in resampled-point units",
     )
     parser.add_argument(
+        "--z",
+        type=float,
+        default=None,
+        help="Redshift for converting spline lengths and residuals to proper kpc",
+    )
+    parser.add_argument(
+        "--pixscale-arcsec",
+        type=float,
+        default=LEGACY_PIXSCALE_ARCSEC,
+        help="Pixel scale in arcsec/pixel (default: Legacy Survey 0.262)",
+    )
+    parser.add_argument(
         "--plot",
         nargs="?",
         const="",
         default=None,
-        help="Show plot, or save to a file if a path is provided",
+        help="Show residual plot, or save to a file if a path is provided",
     )
     args = parser.parse_args()
 
     raw_a = load_xy_csv(args.csv_a, x_col=args.x_col, y_col=args.y_col)
     raw_b = load_xy_csv(args.csv_b, x_col=args.x_col, y_col=args.y_col)
+
+    raw_length_a = curve_length(raw_a)
+    raw_length_b = curve_length(raw_b)
+    scale_info = make_scale_info(z=args.z, pixscale_arcsec=args.pixscale_arcsec)
 
     a_resamp, _ = resample_curve(raw_a, args.n_samples)
     b_resamp, _ = resample_curve(raw_b, args.n_samples)
@@ -380,11 +552,14 @@ def main():
         file_b=args.csv_b,
         n_samples=args.n_samples,
         smooth_sigma=args.smooth_sigma,
+        raw_length_a=raw_length_a,
+        raw_length_b=raw_length_b,
+        scale_info=scale_info,
     )
 
     if args.plot is not None:
         outpath = args.plot if args.plot != "" else None
-        maybe_plot(result, outpath=outpath)
+        maybe_plot(result, scale_info=scale_info, outpath=outpath)
 
 
 if __name__ == "__main__":
