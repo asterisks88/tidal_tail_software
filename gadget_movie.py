@@ -18,9 +18,17 @@ from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.wcs.utils import proj_plane_pixel_scales
 from scipy import ndimage
+from vtkmodules.vtkCommonCore import vtkPoints
+from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPolyData
 from vtkmodules.vtkInteractionWidgets import (
     vtkDistanceRepresentation3D,
     vtkDistanceWidget,
+)
+from vtkmodules.vtkRenderingCore import (
+    vtkActor2D,
+    vtkCoordinate,
+    vtkPolyDataMapper2D,
+    vtkTextActor,
 )
 
 paused = False
@@ -36,6 +44,7 @@ M_SUN_R = 4.64  # Absolute magnitude of Sun in SDSS r-band (approximate)
 ARCSEC_IN_DEG = 3600.0
 LEGACY_PIXEL_WIDTH = 0.262  # arcsec
 LEGACY_PIXEL_AREA = LEGACY_PIXEL_WIDTH**2
+SCALE_BAR_KPC = 100.0
 
 # Define colors and labels for PartTypes
 type_map = {
@@ -668,6 +677,77 @@ def _tail_bbox_report(
     return out
 
 
+def _make_line_polydata_with_ticks(start, end, up, tick_len):
+    """
+    Build a PolyData containing one horizontal bar plus end ticks.
+    """
+    start = np.asarray(start, dtype=np.float64)
+    end = np.asarray(end, dtype=np.float64)
+    up = np.asarray(up, dtype=np.float64)
+
+    p0 = start
+    p1 = end
+    p2 = start - 0.5 * tick_len * up
+    p3 = start + 0.5 * tick_len * up
+    p4 = end - 0.5 * tick_len * up
+    p5 = end + 0.5 * tick_len * up
+
+    pts = np.vstack([p0, p1, p2, p3, p4, p5])
+
+    # Three line segments:
+    #   main bar:  0 -> 1
+    #   left tick: 2 -> 3
+    #   right tick:4 -> 5
+    lines = np.hstack(
+        [
+            np.array([2, 0, 1], dtype=np.int64),
+            np.array([2, 2, 3], dtype=np.int64),
+            np.array([2, 4, 5], dtype=np.int64),
+        ]
+    )
+
+    poly = pv.PolyData()
+    poly.points = pts
+    poly.lines = lines
+    return poly
+
+
+def _camera_basis_and_view_extents(plotter: pv.Plotter):
+    """
+    Return camera basis vectors and approximate focal-plane half extents in world units.
+
+    Returns
+    -------
+    cam_pos, focal, forward, right, up, half_w, half_h, dist
+    """
+    cam = plotter.camera
+
+    cam_pos = np.array(cam.GetPosition(), dtype=np.float64)
+    focal = np.array(cam.GetFocalPoint(), dtype=np.float64)
+    view_up = np.array(cam.GetViewUp(), dtype=np.float64)
+
+    forward = focal - cam_pos
+    dist = float(np.linalg.norm(forward))
+    forward /= dist + 1e-30
+
+    up = view_up - np.dot(view_up, forward) * forward
+    up /= np.linalg.norm(up) + 1e-30
+
+    right = np.cross(forward, up)
+    right /= np.linalg.norm(right) + 1e-30
+
+    win_w, win_h = plotter.window_size
+    aspect = float(win_w) / float(win_h) if win_h > 0 else 1.0
+
+    if bool(cam.GetParallelProjection()):
+        half_h = float(cam.GetParallelScale())
+    else:
+        half_h = dist * np.tan(np.deg2rad(float(cam.GetViewAngle())) / 2.0)
+
+    half_w = aspect * half_h
+    return cam_pos, focal, forward, right, up, half_w, half_h, dist
+
+
 def _project_particles_to_pixel_offsets(
     particles,
     camera,
@@ -1232,6 +1312,49 @@ def _render_shared_outputs(
     return brick_img, host_img, float(pixel_scale_arcsec), tail_report, meta
 
 
+def _world_to_display(plotter: pv.Plotter, xyz):
+    """
+    Convert a 3D world position to display-pixel coordinates.
+    """
+    xyz = np.asarray(xyz, dtype=np.float64)
+    ren = plotter.renderer
+    ren.SetWorldPoint(float(xyz[0]), float(xyz[1]), float(xyz[2]), 1.0)
+    ren.WorldToDisplay()
+    x, y, _z = ren.GetDisplayPoint()
+    return float(x), float(y)
+
+
+def _make_2d_scale_bar_poly(x0, y0, x1, tick_half_len):
+    """
+    Build a 2D PolyData scale bar in DISPLAY coordinates.
+    """
+    pts = vtkPoints()
+    pts.InsertNextPoint(float(x0), float(y0), 0.0)  # 0 main start
+    pts.InsertNextPoint(float(x1), float(y0), 0.0)  # 1 main end
+    pts.InsertNextPoint(float(x0), float(y0 - tick_half_len), 0.0)  # 2 left tick bottom
+    pts.InsertNextPoint(float(x0), float(y0 + tick_half_len), 0.0)  # 3 left tick top
+    pts.InsertNextPoint(
+        float(x1), float(y0 - tick_half_len), 0.0
+    )  # 4 right tick bottom
+    pts.InsertNextPoint(float(x1), float(y0 + tick_half_len), 0.0)  # 5 right tick top
+
+    lines = vtkCellArray()
+
+    def add_line(i, j):
+        lines.InsertNextCell(2)
+        lines.InsertCellPoint(i)
+        lines.InsertCellPoint(j)
+
+    add_line(0, 1)
+    add_line(2, 3)
+    add_line(4, 5)
+
+    poly = vtkPolyData()
+    poly.SetPoints(pts)
+    poly.SetLines(lines)
+    return poly
+
+
 def gadget_hdf5_movie(
     snap_format,
     step_size,
@@ -1360,7 +1483,9 @@ def gadget_hdf5_movie(
         window_size=window_size,
     )
 
-    p.add_axes()
+    p.add_axes(viewport=(0.00, 0.03, 0.25, 0.25))
+    axes_visible = True
+
     p.set_background("white")
     p.camera_position = camera_pos
 
@@ -1370,6 +1495,12 @@ def gadget_hdf5_movie(
         p.add_key_event("Prior", step_backward)
         p.iren.add_observer("WindowCloseEvent", on_window_close)
         p.iren.add_observer("ExitEvent", on_window_close)
+    scale_bar_poly = None
+    scale_bar_mapper = None
+    scale_bar_actor = None
+    scale_bar_label_actor = None
+    scale_bar_visible = True
+    _scale_bar_last = None
 
     # Open the first frame to initialize datasets + galaxy ID ranges
     first_file = snap_format.format(start_frame)
@@ -1417,17 +1548,61 @@ def gadget_hdf5_movie(
                 label=label,
             )
 
-    p.add_legend()
+    legend_actor = p.add_legend()
+    legend_visible = True
     text_actor = p.add_text(
         f"Frame: {start_frame} Time: {time_myr0:.3f} Myr",
-        position="lower_left",
-        font_size=12,
+        position=(20, 20),  # pixel coordinates from lower-left
+        font_size=24,  # twice as big as 12
         color="blue",
+        name="frame_text",
     )
 
     iren = p.iren.interactor
     ruler, rep = make_ruler_widget(iren)
     label_actor = None
+
+    def toggle_axes_display():
+        nonlocal axes_visible
+        axes_visible = not axes_visible
+
+        try:
+            if axes_visible:
+                p.show_axes()
+            else:
+                p.hide_axes()
+        except Exception as e:
+            print(f"[Error] Failed to toggle axes display: {e}", file=sys.stderr)
+            return
+
+        try:
+            p.render()
+        except Exception:
+            pass
+
+    p.add_key_event("a", toggle_axes_display)
+
+    def toggle_legend_display():
+        nonlocal legend_visible, legend_actor
+        legend_visible = not legend_visible
+
+        try:
+            if legend_actor is not None:
+                legend_actor.SetVisibility(bool(legend_visible))
+            else:
+                # Fallback: recreate if somehow missing
+                if legend_visible:
+                    legend_actor = p.add_legend()
+        except Exception as e:
+            print(f"[Error] Failed to toggle legend display: {e}", file=sys.stderr)
+            return
+
+        try:
+            p.render()
+        except Exception:
+            pass
+
+    p.add_key_event("g", toggle_legend_display)
 
     def toggle_ruler():
         nonlocal ruler, rep, label_actor
@@ -1451,6 +1626,129 @@ def gadget_hdf5_movie(
         p.render()
 
     p.add_key_event("l", toggle_ruler)
+
+    def toggle_scale_bar():
+        nonlocal scale_bar_visible
+        scale_bar_visible = not scale_bar_visible
+        update_scale_bar(force=True)
+        try:
+            p.render()
+        except Exception:
+            pass
+
+    p.add_key_event("k", toggle_scale_bar)
+
+    def update_scale_bar(force=False):
+        """
+        Draw/update a 50 kpc scale bar as a 2D overlay in the lower-right corner.
+        The bar length changes with zoom, but its anchor position is stable.
+        """
+        nonlocal scale_bar_poly
+        nonlocal scale_bar_mapper
+        nonlocal scale_bar_actor
+        nonlocal scale_bar_label_actor
+        nonlocal _scale_bar_last
+
+        if not scale_bar_visible:
+            if scale_bar_actor is not None:
+                scale_bar_actor.SetVisibility(False)
+            if scale_bar_label_actor is not None:
+                scale_bar_label_actor.SetVisibility(False)
+            return
+
+        try:
+            (
+                cam_pos,
+                focal,
+                forward,
+                right,
+                up,
+                half_w,
+                half_h,
+                dist,
+            ) = _camera_basis_and_view_extents(p)
+        except Exception:
+            return
+
+        win_w, win_h = p.window_size
+        if win_w <= 0 or win_h <= 0 or half_w <= 0:
+            return
+
+        # Convert 50 kpc into display pixels using the current focal-plane width.
+        # Visible world width at focal plane is 2*half_w.
+        px_per_kpc = float(win_w) / (2.0 * float(half_w))
+        bar_len_px = SCALE_BAR_KPC * px_per_kpc
+
+        # Stable lower-right anchoring in display pixels.
+        margin_right = 70.0
+        margin_bottom = 55.0
+        tick_half_len = 10.0
+        label_offset = 4.0  # closer to the bar vertically
+
+        x1 = float(win_w) - margin_right
+        x0 = x1 - bar_len_px
+        y0 = margin_bottom
+
+        # If the bar becomes wider than the window, clamp it.
+        if x0 < 20.0:
+            x0 = 20.0
+            x1 = x0 + bar_len_px
+
+        geom = (
+            round(x0, 2),
+            round(x1, 2),
+            round(y0, 2),
+            round(bar_len_px, 2),
+            int(win_w),
+            int(win_h),
+        )
+        if (not force) and (_scale_bar_last == geom):
+            return
+        _scale_bar_last = geom
+
+        new_poly = _make_2d_scale_bar_poly(x0, y0, x1, tick_half_len)
+
+        if scale_bar_poly is None:
+            scale_bar_poly = new_poly
+
+            scale_bar_mapper = vtkPolyDataMapper2D()
+            scale_bar_mapper.SetInputData(scale_bar_poly)
+
+            coord = vtkCoordinate()
+            coord.SetCoordinateSystemToDisplay()
+            scale_bar_mapper.SetTransformCoordinate(coord)
+
+            scale_bar_actor = vtkActor2D()
+            scale_bar_actor.SetMapper(scale_bar_mapper)
+            scale_bar_actor.GetProperty().SetColor(0.0, 0.0, 0.0)
+            scale_bar_actor.GetProperty().SetLineWidth(3.0)
+
+            p.renderer.AddActor2D(scale_bar_actor)
+        else:
+            scale_bar_poly.SetPoints(new_poly.GetPoints())
+            scale_bar_poly.SetLines(new_poly.GetLines())
+            scale_bar_poly.Modified()
+            scale_bar_actor.SetVisibility(True)
+
+        if scale_bar_label_actor is None:
+            scale_bar_label_actor = vtkTextActor()
+            scale_bar_label_actor.SetInput(f"{int(SCALE_BAR_KPC)} kpc")
+
+            tp = scale_bar_label_actor.GetTextProperty()
+            tp.SetFontSize(24)
+            tp.SetColor(0.0, 0.0, 0.0)
+            tp.BoldOn()
+            tp.SetJustificationToCentered()
+            tp.SetVerticalJustificationToBottom()
+
+            p.renderer.AddActor2D(scale_bar_label_actor)
+
+        label_x = int(round(0.5 * (x0 + x1)))
+        label_y = int(round(y0 + tick_half_len + label_offset))
+
+        scale_bar_label_actor.SetInput(f"{int(SCALE_BAR_KPC)} kpc")
+        scale_bar_label_actor.SetDisplayPosition(label_x, label_y)
+        scale_bar_label_actor.SetVisibility(True)
 
     def _load_luminous_frame(frame_num: int):
         """
@@ -1875,6 +2173,51 @@ def gadget_hdf5_movie(
 
         print(f"[BatchSave] Done. Wrote {batch_count} files to {out_dir}")
 
+    def save_viewer_snapshot():
+        """
+        Save a screenshot of the current PyVista viewer exactly as displayed.
+        This includes the current camera/view and any visible overlays rendered
+        in the window.
+        """
+        global current_frame
+
+        filename = None
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            fn = filedialog.asksaveasfilename(
+                title="Save viewer snapshot",
+                initialfile=f"gadget_frame_{current_frame:06d}.png",
+                defaultextension=".png",
+                filetypes=[
+                    ("PNG image", "*.png"),
+                    ("JPEG image", "*.jpg"),
+                    ("JPEG image", "*.jpeg"),
+                    ("All files", "*.*"),
+                ],
+            )
+            root.destroy()
+            if fn:
+                filename = fn
+        except Exception:
+            filename = input(
+                f"Enter output image filename [gadget_frame_{current_frame:06d}.png]: "
+            ).strip()
+            if not filename:
+                filename = f"gadget_frame_{current_frame:06d}.png"
+
+        if not filename:
+            print("Snapshot save cancelled.", file=sys.stderr)
+            return
+
+        try:
+            p.render()
+            p.screenshot(filename)
+            print(f"Saved viewer snapshot to: {filename}")
+        except Exception as e:
+            print(f"[Error] Failed to save viewer snapshot: {e}", file=sys.stderr)
+
+    p.add_key_event("y", save_viewer_snapshot)
     p.add_key_event("s", save_surface_brightness)
     p.add_key_event("n", save_noise_realization_batch)
 
@@ -2091,10 +2434,12 @@ def gadget_hdf5_movie(
 
     # Initialize render window
     p.show(auto_close=False, interactive_update=show_window)
+    update_scale_bar(force=True)
 
     # Apply requested camera after show()
     if camera_load:
         load_camera_json(p, camera_load)
+        update_scale_bar(force=True)
 
     if show_window:
 
@@ -2120,17 +2465,21 @@ def gadget_hdf5_movie(
                 if coords is None:
                     coords = np.empty((0, 3), dtype=np.float64)
                 clouds[key].points = coords
-
         try:
             text_actor.SetInput(f"Frame: {frame_num} Time: {time_myr:.3f} Myr")
         except Exception:
-            p.remove_actor(text_actor)
+            try:
+                p.remove_actor(text_actor)
+            except Exception:
+                pass
             text_actor = p.add_text(
                 f"Frame: {frame_num} Time: {time_myr:.3f} Myr",
-                position="lower_left",
-                font_size=12,
+                position=(20, 20),
+                font_size=24,
                 color="blue",
+                name="frame_text",
             )
+        update_scale_bar()
 
     current_frame = start_frame
 
@@ -2172,6 +2521,7 @@ def gadget_hdf5_movie(
                         keep_looping = False
                         break
                 else:
+                    update_scale_bar()
                     p.update()
                     time.sleep(time_delay)
 
@@ -2218,7 +2568,7 @@ def main():
         "--show", action="store_true", help="Show window while recording MP4"
     )
     parser.add_argument(
-        "--window-size", type=int, nargs=2, metavar=("W", "H"), default=(1280, 720)
+        "--window-size", type=int, nargs=2, metavar=("W", "H"), default=(1000, 1000)
     )
 
     parser.add_argument(
