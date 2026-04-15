@@ -9,10 +9,15 @@ Outputs a multi-product MEF:
   - MU_OBS, MU_REST (if --z provided)
 
 Requires: astropy, photutils; (optional) scipy for mask dilation fallback.
+
+New:
+  - Can use an externally supplied FITS mask via --mask-fits instead of
+    computing a source mask internally.
 """
 
 import argparse
 import math
+import os
 
 import astropy.units as u
 import numpy as np
@@ -95,9 +100,9 @@ def _kernel_stats(ker: np.ndarray, pix_area_arcsec2: float):
     """
     w = ker.astype(float)
     w /= w.sum()
-    neff = 1.0 / float((w * w).sum())  # effective number of pixels
-    area_eff = neff * pix_area_arcsec2  # effective area in arcsec^2
-    dmu = 1.25 * math.log10(neff)  # expected SB gain in mag
+    neff = 1.0 / float((w * w).sum())
+    area_eff = neff * pix_area_arcsec2
+    dmu = 1.25 * math.log10(neff)
     return neff, area_eff, dmu
 
 
@@ -115,10 +120,12 @@ def _fallback_source_mask(data, nsigma=2.0, npixels=20, dilate_size=5, maxiters=
         base = (segm.data > 0) if segm is not None else (data > med + nsigma * std)
     else:
         base = data > med + nsigma * std
+
     if "binary_dilation" in globals() and binary_dilation is not None:
         return binary_dilation(base, iterations=max(1, int(dilate_size // 2))).astype(
             np.uint8
         )
+
     ker = Box2DKernel(max(1, int(dilate_size)))
     return (_conv(base.astype(float), ker, normalize_kernel=False) > 0).astype(np.uint8)
 
@@ -133,9 +140,73 @@ def build_source_mask(data, nsigma=2.0, npixels=20, dilate_size=5, maxiters=3):
             sigclip=SigmaClip(sigma=3.0, maxiters=maxiters),
         )
         return mask.astype(np.uint8)
+
     return _fallback_source_mask(
         data, nsigma=nsigma, npixels=npixels, dilate_size=dilate_size, maxiters=maxiters
     )
+
+
+def _read_first_image_hdu(path):
+    with fits.open(path, memmap=True) as hdul:
+        hdu = next((h for h in hdul if getattr(h, "data", None) is not None), None)
+        if hdu is None or hdu.data is None:
+            raise RuntimeError(f"No image data found in {path}")
+        return np.array(hdu.data), hdu.header.copy()
+
+
+def _read_hdu_by_spec(path, hdu_spec):
+    with fits.open(path, memmap=True) as hdul:
+        if hdu_spec is None:
+            hdu = next((h for h in hdul if getattr(h, "data", None) is not None), None)
+            if hdu is None or hdu.data is None:
+                raise RuntimeError(f"No image data found in {path}")
+            return np.array(hdu.data), hdu.header.copy()
+
+        try:
+            idx = int(hdu_spec)
+            hdu = hdul[idx]
+            if hdu.data is None:
+                raise RuntimeError(f"HDU {idx} in {path} has no data")
+            return np.array(hdu.data), hdu.header.copy()
+        except ValueError:
+            pass
+
+        target = str(hdu_spec).strip().upper()
+        for hdu in hdul:
+            name = str(getattr(hdu, "name", "")).strip().upper()
+            if name == target and getattr(hdu, "data", None) is not None:
+                return np.array(hdu.data), hdu.header.copy()
+
+        raise RuntimeError(f"Could not find HDU '{hdu_spec}' with image data in {path}")
+
+
+def read_external_mask(mask_fits, mask_hdu=None, expected_shape=None):
+    """
+    Read an external mask FITS.
+
+    Interpretation:
+      - 0       => unmasked
+      - nonzero => masked
+      - NaN/inf => masked
+
+    Returns uint8 mask with 1=masked, 0=good.
+    """
+    mask_data, _ = _read_hdu_by_spec(mask_fits, mask_hdu)
+    mask_data = np.squeeze(mask_data)
+
+    if mask_data.ndim != 2:
+        raise RuntimeError(
+            f"External mask must be 2D after squeeze(); got shape {mask_data.shape}"
+        )
+
+    if expected_shape is not None and mask_data.shape != expected_shape:
+        raise RuntimeError(
+            f"External mask shape {mask_data.shape} does not match input image shape "
+            f"{expected_shape}"
+        )
+
+    mask = ((~np.isfinite(mask_data)) | (mask_data != 0)).astype(np.uint8)
+    return mask
 
 
 def estimate_background(
@@ -143,7 +214,9 @@ def estimate_background(
 ):
     if mode == "none":
         return np.zeros_like(data, dtype=float), {"BKGMODE": "NONE"}
+
     sc = SigmaClip(sigma=sigma_clip, maxiters=maxiters)
+
     if mode == "global":
         mean, med, std = sigma_clipped_stats(
             data[~mask.astype(bool)], sigma=sigma_clip, maxiters=maxiters
@@ -155,6 +228,7 @@ def estimate_background(
             "BKGMED": float(med),
             "BKGSTD": float(std),
         }
+
     bkg2d = Background2D(
         data,
         box_size=box_size,
@@ -184,18 +258,17 @@ def _box_kernel(box_px, normalize=True):
 
 
 def _gauss_kernel(sigma_px):
-    # Gaussian2DKernel is already unit-integral (sum≈1)
     return Gaussian2DKernel(x_stddev=float(sigma_px), y_stddev=float(sigma_px)).array
 
 
 def _size_to_pixels(size_value, size_in_arcsec, header, is_sigma=False, is_box=False):
-    """Convert a user size (arcsec or px) to pixels (float for sigma, int for box side)."""
+    """Convert a user size (arcsec or px) to pixels."""
     if size_in_arcsec:
         sx, sy = pixel_scale_arcsec(header)
-        # Use x-scale for conversion (Legacy pixels are effectively square)
         s_px = float(size_value) / sx
     else:
         s_px = float(size_value)
+
     if is_sigma:
         return max(s_px, 0.1)
     if is_box:
@@ -211,14 +284,12 @@ def smooth_flux(data_nmgy_pix, hdr, args):
     img = np.array(data_nmgy_pix, dtype=float)
 
     if args.smooth == "box":
-        # size in px or arcsec
         box_px = _size_to_pixels(args.box_size, args.size_arcsec, hdr, is_box=True)
         ker = _box_kernel(box_px, normalize=(args.kernel_mode == "mean"))
         sigma_px = None
         fwhm_px = None
 
     elif args.smooth == "gauss":
-        # prefer sigma; otherwise convert FWHM to sigma
         if args.gauss_sigma is not None:
             sigma_px = _size_to_pixels(
                 args.gauss_sigma, args.size_arcsec, hdr, is_sigma=True
@@ -233,17 +304,15 @@ def smooth_flux(data_nmgy_pix, hdr, args):
             raise ValueError(
                 "For --smooth gauss, provide --gauss-sigma or --gauss-fwhm"
             )
-        ker = _gauss_kernel(sigma_px)  # unit-integral
+        ker = _gauss_kernel(sigma_px)
 
     else:
         raise ValueError("Unknown smoothing mode.")
 
-    # Convolve with NaN-aware handling; we control normalization via ker itself
     sm = convolve(
         img, ker, boundary="extend", nan_treatment="interpolate", normalize_kernel=False
     )
 
-    # Metadata (SHORT, FITS-classic keys elsewhere)
     meta = {"SMOOTH": args.smooth}
     if args.smooth == "box":
         meta["BOXPX"] = int(ker.shape[0])
@@ -252,11 +321,10 @@ def smooth_flux(data_nmgy_pix, hdr, args):
         meta["GSIGPX"] = float(sigma_px)
         meta["GFWHMPX"] = float(fwhm_px)
 
-    # Effective area / SB gain
     neff, area_eff_as2, dmu = _kernel_stats(ker, pixel_area_arcsec2(hdr))
-    meta["NEFFPX"] = float(neff)  # px^2
-    meta["NEFFAS"] = float(area_eff_as2)  # arcsec^2
-    meta["DMUGAIN"] = float(dmu)  # mag
+    meta["NEFFPX"] = float(neff)
+    meta["NEFFAS"] = float(area_eff_as2)
+    meta["DMUGAIN"] = float(dmu)
 
     return sm, meta
 
@@ -270,6 +338,26 @@ def main():
     )
     ap.add_argument("input_fits")
     ap.add_argument("output_fits")
+
+    # Optional external mask
+    ap.add_argument(
+        "--mask-fits",
+        default=None,
+        help=(
+            "Optional FITS file containing a precomputed mask. "
+            "Nonzero pixels are treated as masked and used instead of computing "
+            "a source mask from the image."
+        ),
+    )
+    ap.add_argument(
+        "--mask-hdu",
+        default=None,
+        help=(
+            "HDU index or EXTNAME within --mask-fits. "
+            "Default: first HDU with image data."
+        ),
+    )
+
     # Background
     ap.add_argument("--bkg-mode", choices=["2d", "global", "none"], default="2d")
     ap.add_argument(
@@ -279,13 +367,14 @@ def main():
         "--filter-size", type=int, default=5, help="Background2D filter size (odd)."
     )
     ap.add_argument(
-        "--nsigma", type=float, default=2.0, help="Source-mask threshold in σ."
+        "--nsigma", type=float, default=2.0, help="Source-mask threshold in sigma."
     )
     ap.add_argument(
-        "--npixels", type=int, default=20, help="Min connected pixels in mask."
+        "--npixels", type=int, default=20, help="Min connected pixels in auto mask."
     )
-    ap.add_argument("--dilate", type=int, default=7, help="Mask dilation (px).")
-    # Smoothing (new)
+    ap.add_argument("--dilate", type=int, default=7, help="Auto-mask dilation (px).")
+
+    # Smoothing
     ap.add_argument(
         "--smooth",
         choices=["none", "box", "gauss"],
@@ -301,13 +390,13 @@ def main():
         "--box-size-smooth",
         type=float,
         default=13,
-        help="Box kernel side (px or arcsec) for --smooth box. Default 13.",
+        help="Box kernel side (px or arcsec) for --smooth box.",
     )
     ap.add_argument(
         "--gauss-sigma",
         type=float,
         default=None,
-        help="Gaussian σ (px or arcsec) for --smooth gauss.",
+        help="Gaussian sigma (px or arcsec) for --smooth gauss.",
     )
     ap.add_argument(
         "--gauss-fwhm",
@@ -321,43 +410,72 @@ def main():
         default="mean",
         help="For box smoothing: 'mean' (normalized) or 'sum'. Gaussian is always unit-integral.",
     )
-    # μ floor & cosmology
+
+    # mu floor & cosmology
     ap.add_argument(
         "--mu-floor",
         type=float,
         default=32.0,
-        help="Faintest μ allowed (mag/arcsec^2).",
+        help="Faintest mu allowed (mag/arcsec^2).",
     )
-    ap.add_argument("--z", type=float, default=None, help="Redshift for rest-frame μ.")
+    ap.add_argument("--z", type=float, default=None, help="Redshift for rest-frame mu.")
     ap.add_argument("--kcorr", type=float, default=None, help="K-correction [mag].")
     ap.add_argument(
         "--alpha",
         type=float,
         default=None,
-        help="Spectral index α if --kcorr omitted (f_nu ∝ nu^α).",
+        help="Spectral index alpha if --kcorr omitted (f_nu ∝ nu^alpha).",
     )
     ap.add_argument(
         "--report-kernel-area",
         action="store_true",
-        help="Print effective area (px^2 / arcsec^2) and expected SB gain Δμ for the smoothing kernel.",
+        help="Print effective area and expected SB gain for the smoothing kernel.",
     )
 
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
 
-    with fits.open(args.input_fits, memmap=True) as hdul:
-        hdu = next((h for h in hdul if h.data is not None), None)
-        if hdu is None:
-            raise RuntimeError("No image data found.")
-        data_nmgy_pix = np.array(hdu.data, dtype=float)
-        hdr = hdu.header.copy()
+    data_nmgy_pix, hdr = _read_first_image_hdu(args.input_fits)
+    data_nmgy_pix = np.squeeze(data_nmgy_pix)
+    if data_nmgy_pix.ndim != 2:
+        raise RuntimeError(
+            f"Input image must be 2D after squeeze(); got shape {data_nmgy_pix.shape}"
+        )
 
     area_arcsec2 = pixel_area_arcsec2(hdr)
 
-    # Build mask & background (on original flux)
-    mask = build_source_mask(
-        data_nmgy_pix, nsigma=args.nsigma, npixels=args.npixels, dilate_size=args.dilate
-    )
+    # Build or load mask
+    if args.mask_fits is not None:
+        mask = read_external_mask(
+            args.mask_fits, mask_hdu=args.mask_hdu, expected_shape=data_nmgy_pix.shape
+        )
+        mask_meta = {
+            "MASKMODE": "EXTERN",
+            "MASKPATH": os.path.basename(args.mask_fits),
+        }
+        if args.mask_hdu is not None:
+            mask_meta["MASKHDU"] = str(args.mask_hdu)
+        print(f"Using external mask: {args.mask_fits}")
+        if args.mask_hdu is not None:
+            print(f"  mask HDU: {args.mask_hdu}")
+    else:
+        mask = build_source_mask(
+            data_nmgy_pix,
+            nsigma=args.nsigma,
+            npixels=args.npixels,
+            dilate_size=args.dilate,
+        )
+        mask_meta = {
+            "MASKMODE": "AUTO",
+            "MASKNSIG": float(args.nsigma),
+            "MASKNPIX": int(args.npixels),
+            "MASKDIL": int(args.dilate),
+        }
+        print(
+            f"Using auto mask: nsigma={args.nsigma}, npixels={args.npixels}, dilate={args.dilate}"
+        )
+
+    # Background
     bkg_map_nmgy, bkg_meta = estimate_background(
         data_nmgy_pix,
         mask,
@@ -369,12 +487,11 @@ def main():
     # Sky subtraction in flux
     sky_sub_nmgy_pix = data_nmgy_pix - bkg_map_nmgy
 
-    # ----- optional smoothing (in flux) BEFORE SB conversion -----
-    # NOTE: we smooth the sky-subtracted flux image
+    # Optional smoothing in flux before SB conversion
     smooth_nmgy_pix = None
     smooth_meta = {}
     if args.smooth != "none":
-        # Use --box-size-smooth (not the background box)
+
         class _Shim:
             pass
 
@@ -386,6 +503,7 @@ def main():
         shim.gauss_sigma = args.gauss_sigma
         shim.gauss_fwhm = args.gauss_fwhm
         smooth_nmgy_pix, smooth_meta = smooth_flux(sky_sub_nmgy_pix, hdr, shim)
+
     if (
         args.smooth != "none"
         and args.report_kernel_area
@@ -393,39 +511,45 @@ def main():
     ):
         ktype = smooth_meta.get("SMOOTH", "?")
         if ktype == "box":
-            desc = f'box {int(smooth_meta["BOXPX"])} px ({smooth_meta.get("KMODE","mean")})'
+            desc = f'box {int(smooth_meta["BOXPX"])} px ({smooth_meta.get("KMODE", "mean")})'
         elif ktype == "gauss":
-            desc = f'gauss FWHM={smooth_meta["GFWHMPX"]:.2f}px (σ={smooth_meta["GSIGPX"]:.2f}px)'
+            desc = (
+                f'gauss FWHM={smooth_meta["GFWHMPX"]:.2f}px '
+                f'(sigma={smooth_meta["GSIGPX"]:.2f}px)'
+            )
         else:
             desc = ktype
+
         print(
             f"[kernel] {desc}  neff={smooth_meta['NEFFPX']:.2f} px^2, "
-            f"A_eff={smooth_meta['NEFFAS']:.1f} arcsec^2,  Δμ={smooth_meta['DMUGAIN']:.2f} mag"
+            f"A_eff={smooth_meta['NEFFAS']:.1f} arcsec^2, "
+            f"Delta_mu={smooth_meta['DMUGAIN']:.2f} mag"
         )
 
-    # Choose which flux to convert to SB: smoothed if present, else sky-subtracted
     flux_for_mu = smooth_nmgy_pix if smooth_nmgy_pix is not None else sky_sub_nmgy_pix
 
-    # SB conversion (nMgy/arcsec^2) and μ with floor
     nmgy_arcsec2 = flux_for_mu / area_arcsec2
     fmin = 10 ** ((AB_ZP_NANOMAGGY - args.mu_floor) / 2.5)
     nmgy_arcsec2 = np.clip(nmgy_arcsec2, fmin, None)
     mu_obs = mu_from_nmgy_arcsec2(nmgy_arcsec2)
 
-    # ----- assemble outputs -----
+    # Assemble outputs
     now = Time.now().isot.split(".")[0] + "Z"
     ph = fits.Header()
     ph["DATE"] = now
-    ph["ORIGIN"] = "mu_from_nmgy (with smoothing)"
+    ph["ORIGIN"] = "mu_from_nmgy"
     ph["BUNIT"] = "mag/arcsec^2"
     ph["PIXA2"] = (area_arcsec2, "Pixel area [arcsec^2]")
     ph["NMZP"] = (AB_ZP_NANOMAGGY, "AB mag of 1 nanomaggy")
     ph["MUFLOOR"] = (args.mu_floor, "mu floor [mag/arcsec^2]")
-    for k, v in bkg_meta.items():
-        try:
-            ph[k] = v
-        except Exception:
-            pass
+
+    for d in (mask_meta, bkg_meta):
+        for k, v in d.items():
+            try:
+                ph[k] = v
+            except Exception:
+                pass
+
     if smooth_nmgy_pix is not None:
         if "SMOOTH" in smooth_meta:
             ph["SMOOTH"] = smooth_meta["SMOOTH"]
@@ -437,6 +561,7 @@ def main():
             ph["GSIGPX"] = float(smooth_meta["GSIGPX"])
         if "GFWHMPX" in smooth_meta:
             ph["GFWHMP"] = float(smooth_meta["GFWHMPX"])
+
     prim = fits.PrimaryHDU(header=ph)
 
     def add_common(h, bunit):
@@ -446,6 +571,13 @@ def main():
         hh["BUNIT"] = bunit
         return hh
 
+    mask_hdr = fits.Header()
+    for k, v in mask_meta.items():
+        try:
+            mask_hdr[k] = v
+        except Exception:
+            pass
+
     hdus = [
         prim,
         fits.ImageHDU(
@@ -453,7 +585,11 @@ def main():
             header=add_common(hdr, "nMgy/pix"),
             name="DATA_NMGY",
         ),
-        fits.ImageHDU(data=mask.astype(np.uint8), header=fits.Header(), name="MASK"),
+        fits.ImageHDU(
+            data=mask.astype(np.uint8),
+            header=mask_hdr,
+            name="MASK",
+        ),
         fits.ImageHDU(
             data=bkg_map_nmgy.astype(np.float32),
             header=add_common(hdr, "nMgy/pix"),
@@ -465,6 +601,7 @@ def main():
             name="SKY_SUB_NMGY",
         ),
     ]
+
     if smooth_nmgy_pix is not None:
         hdus.append(
             fits.ImageHDU(
@@ -473,6 +610,7 @@ def main():
                 name="SKY_SUB_SMOOTH_NMGY",
             )
         )
+
     hdus.append(
         fits.ImageHDU(
             data=mu_obs.astype(np.float32),
@@ -491,7 +629,11 @@ def main():
         if args.kcorr is None and args.alpha is not None:
             h_mur["KALPHA"] = (args.alpha, "f_nu ∝ nu^alpha")
         hdus.append(
-            fits.ImageHDU(data=mu_rest.astype(np.float32), header=h_mur, name="MU_REST")
+            fits.ImageHDU(
+                data=mu_rest.astype(np.float32),
+                header=h_mur,
+                name="MU_REST",
+            )
         )
 
     fits.HDUList(hdus).writeto(args.output_fits, overwrite=args.overwrite)
