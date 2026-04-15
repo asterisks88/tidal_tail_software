@@ -595,7 +595,10 @@ def main():
         ML = mlr_bell2003_diet_gr(gmr0)
         ml_name = "Bell+2003 (diet Salpeter)"
     Mstar_Msun = ML * Lr_Lsun
+    # Make mstar_missing = mhalo_missing to make median halo mass match luminous estimate
+    # Mstar figure used to compute luminous mass
     Mstar_Msun_with_stripped = Mstar_Msun * mstar_missing
+    # Mstar figure used to compute halo mass
     Mstar_Msun = Mstar_Msun * mhalo_missing
 
     # --- Disk/Bulge split ---
@@ -809,6 +812,9 @@ def main():
         "stellar_mass": {
             "M_over_L_r": ML,
             "M_star_Msun": Mstar_Msun,
+            "M_star_Msun_with_missing": Mstar_Msun_with_stripped,
+            "Stellar Missing": mstar_missing,
+            "Halo Missing": mhalo_missing,
             "ML_method": ml_name,
             "D_over_T": DT,
             "M_bulge_Msun": Mbulge_Msun,
