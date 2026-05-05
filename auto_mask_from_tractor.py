@@ -5,18 +5,15 @@ auto_mask_from_tractor.py
 Generate a simple maskbits-like image (0=good, nonzero=masked) aligned to a
 Legacy Survey coadd image.
 
-- Stars (type == PSF): circular masks
-- Galaxies (type != PSF): elliptical masks derived from
+- Tractor stars (type == PSF): circular masks
+- Tractor galaxies (type != PSF): elliptical masks derived from
   (shape_r, shape_e1, shape_e2)
+- Optional Gaia sources: circular masks from RA, Dec, and G magnitude
 
 Designed for DR10 Tractor catalogs:
   type: PSF/REX/DEV/EXP/SER ...
-  shape_r: arcsec (half-light radius)
+  shape_r: arcsec
   shape_e1, shape_e2: ellipticity components
-
-References:
-- DR10 tractor catalog columns (type, shape_r, shape_e1/e2) are documented on
-  the Legacy Survey site.
 
 Typical use:
   ./auto_mask_from_tractor.py \
@@ -30,6 +27,11 @@ Typical use:
     --star-mag-alpha 0.35 \
     --star-mag-max-factor 4.0 \
     --gal-kre 4.0 \
+    --gaia gaia_dr3_cutout.fits \
+    --gaia-maglim 20.5 \
+    --gaia-kfwhm 3.5 \
+    --gaia-mag-alpha 0.45 \
+    --gaia-mag-max-factor 5.0 \
     --keep-circle 3200,1550,220 \
     --out-maskbits maskbits_auto.fits
 
@@ -45,13 +47,14 @@ from typing import List, Tuple
 
 import numpy as np
 from astropy.io import fits
+from astropy.table import Table
 from astropy.wcs import WCS
 
 
 def read_image_and_wcs(path: Path, hdu: int) -> tuple[np.ndarray, fits.Header, WCS]:
     with fits.open(path, memmap=True) as hdul:
         data = np.asarray(hdul[hdu].data, dtype=np.float32)
-        hdr = hdul[hdu].header
+        hdr = hdul[hdu].header.copy()
     wcs = WCS(hdr)
     return data, hdr, wcs
 
@@ -62,6 +65,48 @@ def read_table(path: Path, hdu: int) -> np.ndarray:
         if tab is None:
             raise RuntimeError(f"No table in {path} HDU {hdu}")
         return tab
+
+
+def read_astropy_table(path: Path, hdu: int | None = None) -> Table:
+    """
+    Read a local catalog table using astropy.table.Table.
+
+    Works for common formats such as FITS, CSV, and ECSV. For FITS-like
+    filenames, use the requested HDU. For ASCII-like formats, let Astropy infer.
+    """
+    name = path.name.lower()
+    is_fits_like = (
+        name.endswith(".fits")
+        or name.endswith(".fit")
+        or name.endswith(".fits.gz")
+        or name.endswith(".fit.gz")
+        or name.endswith(".fits.fz")
+        or name.endswith(".fz")
+    )
+
+    if is_fits_like:
+        return Table.read(path, hdu=hdu)
+
+    return Table.read(path)
+
+
+def resolve_table_column(tab: Table, requested: str, label: str) -> str:
+    """
+    Resolve a column name case-insensitively.
+    """
+    names = list(tab.colnames)
+    if requested in names:
+        return requested
+
+    lower_map = {n.lower(): n for n in names}
+    key = requested.lower()
+    if key in lower_map:
+        return lower_map[key]
+
+    raise RuntimeError(
+        f"{label} table missing column '{requested}'. "
+        f"Available columns include: {', '.join(names[:30])}"
+    )
 
 
 def nanomaggies_to_abmag(flux_nmgy: np.ndarray) -> np.ndarray:
@@ -87,9 +132,9 @@ def ellipse_params_from_e1e2(e1: float, e2: float) -> Tuple[float, float]:
     """
     Convert (e1, e2) to:
       - axis ratio q = b/a
-      - position angle theta (radians), measured CCW from +x
+      - position angle theta in radians, measured CCW from +x
 
-    Using the common definition:
+    Using:
       e = (a-b)/(a+b)
       e1 = e cos(2 theta)
       e2 = e sin(2 theta)
@@ -113,22 +158,11 @@ def star_radius_factor(
     Multiplicative factor for star mask radius.
 
     For stars near the masking threshold maglim, factor ~ 1.
-    Brighter stars (smaller magnitude) get factor > 1.
+    Brighter stars get factor > 1.
 
-    Parameters
-    ----------
-    mag : float
-        Star magnitude.
-    maglim : float
-        Magnitude threshold used for masking.
-    mode : str
-        'linear' or 'flux'
-        - linear: factor = 1 + alpha * max(0, maglim - mag)
-        - flux  : factor = 10**(0.2 * max(0, maglim - mag))
-    alpha : float
-        Linear scaling strength.
-    max_factor : float
-        Maximum allowed multiplicative boost.
+    mode:
+      linear: factor = 1 + alpha * max(0, maglim - mag)
+      flux  : factor = 10**(0.2 * max(0, maglim - mag))
     """
     dm = max(0.0, float(maglim) - float(mag))
 
@@ -155,7 +189,8 @@ def draw_disk(mask: np.ndarray, xc: float, yc: float, r: float, value: int) -> N
 
     yy, xx = np.mgrid[y0:y1, x0:x1]
     rr2 = (xx - xc) ** 2 + (yy - yc) ** 2
-    mask[y0:y1, x0:x1][rr2 <= r * r] = value
+    sub = mask[y0:y1, x0:x1]
+    sub[rr2 <= r * r] = value
 
 
 def draw_ellipse(
@@ -169,7 +204,6 @@ def draw_ellipse(
 ) -> None:
     ny, nx = mask.shape
 
-    # Conservative bounding-box half-size
     r = max(a, b)
     x0 = max(int(np.floor(xc - r)), 0)
     x1 = min(int(np.ceil(xc + r)) + 1, nx)
@@ -188,7 +222,117 @@ def draw_ellipse(
     yp = -st * dx + ct * dy
 
     val = (xp * xp) / (a * a + 1e-30) + (yp * yp) / (b * b + 1e-30)
-    mask[y0:y1, x0:x1][val <= 1.0] = value
+
+    sub = mask[y0:y1, x0:x1]
+    sub[val <= 1.0] = value
+
+
+def fwhm_arcsec_at_position(
+    psf_map: np.ndarray | None,
+    xi: float,
+    yi: float,
+    nx: int,
+    ny: int,
+    fallback_arcsec: float = 1.3,
+) -> float:
+    if psf_map is None:
+        return fallback_arcsec
+
+    xip = int(np.clip(round(xi), 0, nx - 1))
+    yip = int(np.clip(round(yi), 0, ny - 1))
+    fwhm_arcsec = float(psf_map[yip, xip])
+
+    if not np.isfinite(fwhm_arcsec) or fwhm_arcsec <= 0:
+        fwhm_arcsec = fallback_arcsec
+
+    return fwhm_arcsec
+
+
+def draw_gaia_sources(
+    mask: np.ndarray,
+    wcs: WCS,
+    psf_map: np.ndarray | None,
+    gaia_path: Path,
+    gaia_hdu: int,
+    ra_col_req: str,
+    dec_col_req: str,
+    mag_col_req: str,
+    maglim: float,
+    pixscale_arcsec: float,
+    kfwhm: float,
+    rmin_pix: float,
+    mag_scale: str,
+    mag_alpha: float,
+    mag_max_factor: float,
+    extra_radius_pix: float,
+    mask_value: int,
+    edge_margin_pix: float,
+) -> int:
+    """
+    Add circular masks for Gaia sources.
+
+    The Gaia magnitude is usually phot_g_mean_mag, so the threshold is in G,
+    not Legacy r. Treat --gaia-maglim as a separate tuning parameter.
+    """
+    ny, nx = mask.shape
+
+    tab = read_astropy_table(gaia_path, hdu=gaia_hdu)
+
+    ra_col = resolve_table_column(tab, ra_col_req, "Gaia")
+    dec_col = resolve_table_column(tab, dec_col_req, "Gaia")
+    mag_col = resolve_table_column(tab, mag_col_req, "Gaia")
+
+    ra = np.asarray(tab[ra_col], dtype=np.float64)
+    dec = np.asarray(tab[dec_col], dtype=np.float64)
+    gmag = np.asarray(tab[mag_col], dtype=np.float64)
+
+    good = (
+        np.isfinite(ra) & np.isfinite(dec) & np.isfinite(gmag) & (gmag <= float(maglim))
+    )
+
+    if not np.any(good):
+        return 0
+
+    ra = ra[good]
+    dec = dec[good]
+    gmag = gmag[good]
+
+    x, y = wcs.all_world2pix(ra, dec, 0)
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+
+    margin = float(edge_margin_pix)
+    in_im = (x >= -margin) & (x < nx + margin) & (y >= -margin) & (y < ny + margin)
+
+    x = x[in_im]
+    y = y[in_im]
+    gmag = gmag[in_im]
+
+    n_gaia = 0
+
+    for xi, yi, gi in zip(x, y, gmag):
+        fwhm_arcsec = fwhm_arcsec_at_position(psf_map, xi, yi, nx, ny)
+        fwhm_pix = fwhm_arcsec / pixscale_arcsec
+
+        r_base = max(float(rmin_pix), float(kfwhm) * fwhm_pix)
+
+        mag_fac = star_radius_factor(
+            gi,
+            maglim,
+            mode=mag_scale,
+            alpha=mag_alpha,
+            max_factor=mag_max_factor,
+        )
+
+        r = r_base * mag_fac + float(extra_radius_pix)
+
+        if r <= 0:
+            continue
+
+        draw_disk(mask, xi, yi, r, int(mask_value))
+        n_gaia += 1
+
+    return n_gaia
 
 
 def main() -> None:
@@ -204,7 +348,7 @@ def main() -> None:
         "--psfsize",
         type=Path,
         default=None,
-        help="Optional psfsize coadd image (arcsec) to set per-star radii.",
+        help="Optional psfsize coadd image in arcsec to set per-source radii.",
     )
     ap.add_argument("--psfsize-hdu", type=int, default=1)
 
@@ -214,84 +358,147 @@ def main() -> None:
         "--band",
         choices=["g", "r", "i", "z"],
         default="r",
-        help="Band used for flux->mag cut; expects tractor flux_<band>.",
+        help="Band used for Tractor flux->mag cut; expects tractor flux_<band>.",
     )
     ap.add_argument(
         "--maglim",
         type=float,
         default=24.5,
-        help="Mask objects brighter than this magnitude.",
+        help="Mask Tractor objects brighter than this Legacy-band magnitude.",
     )
 
     ap.add_argument(
         "--star-kfwhm",
         type=float,
         default=3.0,
-        help="Base star radius = star_kfwhm * FWHM_pix (before mag scaling).",
+        help="Base Tractor star radius = star_kfwhm * FWHM_pix.",
     )
     ap.add_argument(
         "--star-rmin-pix",
         type=float,
         default=3.0,
-        help="Minimum base star radius in pixels (before mag scaling).",
+        help="Minimum base Tractor star radius in pixels.",
     )
     ap.add_argument(
         "--star-mag-scale",
         choices=["linear", "flux"],
         default="linear",
-        help=(
-            "How star masks grow for brighter stars. "
-            "'linear' is gentler; 'flux' is more aggressive."
-        ),
+        help="How Tractor star masks grow for brighter stars.",
     )
     ap.add_argument(
         "--star-mag-alpha",
         type=float,
         default=0.5,
-        help=(
-            "Strength of linear brightness scaling. "
-            "Used only if --star-mag-scale=linear."
-        ),
+        help="Strength of linear brightness scaling for Tractor stars.",
     )
     ap.add_argument(
         "--star-mag-max-factor",
         type=float,
         default=5.0,
-        help="Maximum multiplicative radius boost for bright stars.",
+        help="Maximum multiplicative radius boost for Tractor stars.",
     )
 
     ap.add_argument(
         "--gal-kre",
         type=float,
         default=4.0,
-        help="Galaxy semi-major axis = gal_kre * (shape_r/pixscale) in pixels.",
+        help="Galaxy semi-major axis = gal_kre * shape_r / pixscale.",
     )
     ap.add_argument("--gal-amin-pix", type=float, default=4.0)
+
+    # Gaia options
+    ap.add_argument(
+        "--gaia",
+        type=Path,
+        default=None,
+        help=(
+            "Optional local Gaia source table, e.g. FITS/CSV/ECSV. "
+            "Expected columns: ra, dec, phot_g_mean_mag unless overridden."
+        ),
+    )
+    ap.add_argument("--gaia-hdu", type=int, default=1)
+    ap.add_argument("--gaia-ra-col", type=str, default="ra")
+    ap.add_argument("--gaia-dec-col", type=str, default="dec")
+    ap.add_argument("--gaia-mag-col", type=str, default="phot_g_mean_mag")
+    ap.add_argument(
+        "--gaia-maglim",
+        type=float,
+        default=20.5,
+        help="Mask Gaia sources brighter than this Gaia G magnitude.",
+    )
+    ap.add_argument(
+        "--gaia-kfwhm",
+        type=float,
+        default=None,
+        help=("Base Gaia radius = gaia_kfwhm * FWHM_pix. " "Defaults to --star-kfwhm."),
+    )
+    ap.add_argument(
+        "--gaia-rmin-pix",
+        type=float,
+        default=None,
+        help="Minimum Gaia source radius in pixels. Defaults to --star-rmin-pix.",
+    )
+    ap.add_argument(
+        "--gaia-mag-scale",
+        choices=["linear", "flux"],
+        default=None,
+        help="Gaia brightness-radius scaling. Defaults to --star-mag-scale.",
+    )
+    ap.add_argument(
+        "--gaia-mag-alpha",
+        type=float,
+        default=None,
+        help="Linear Gaia brightness scaling strength. Defaults to --star-mag-alpha.",
+    )
+    ap.add_argument(
+        "--gaia-mag-max-factor",
+        type=float,
+        default=None,
+        help="Maximum Gaia radius boost. Defaults to --star-mag-max-factor.",
+    )
+    ap.add_argument(
+        "--gaia-extra-radius-pix",
+        type=float,
+        default=0.0,
+        help="Extra pixels added to every Gaia mask radius after magnitude scaling.",
+    )
+    ap.add_argument(
+        "--gaia-mask-value",
+        type=int,
+        default=None,
+        help="Mask value for Gaia sources. Defaults to --mask-value.",
+    )
+    ap.add_argument(
+        "--gaia-edge-margin-pix",
+        type=float,
+        default=200.0,
+        help="Keep Gaia sources this far outside the image for edge masks.",
+    )
 
     ap.add_argument(
         "--mask-value",
         type=int,
         default=1,
-        help="Nonzero value written into masked pixels (0 remains unmasked).",
+        help="Nonzero value written into masked pixels.",
     )
 
     only_grp = ap.add_mutually_exclusive_group()
     only_grp.add_argument(
         "--stars-only",
         action="store_true",
-        help="Mask only PSF sources.",
+        help="Mask only stellar sources: Tractor PSF plus optional Gaia.",
     )
     only_grp.add_argument(
         "--galaxies-only",
         action="store_true",
-        help="Mask only extended sources.",
+        help="Mask only Tractor extended sources. Gaia is skipped.",
     )
 
     ap.add_argument(
         "--keep-circle",
         action="append",
         default=[],
-        help="Do NOT mask inside this circle (pixels): 'x,y,r'. Can repeat.",
+        help="Do NOT mask inside this circle, in pixels: 'x,y,r'. Can repeat.",
     )
     ap.add_argument("--out-maskbits", type=Path, required=True)
 
@@ -310,7 +517,6 @@ def main() -> None:
 
     tab = read_table(args.tractor, args.tractor_hdu)
 
-    # Required columns
     for col in ["ra", "dec", "type"]:
         if col not in tab.names:
             raise RuntimeError(f"Tractor table missing column '{col}'")
@@ -322,14 +528,12 @@ def main() -> None:
     mag = nanomaggies_to_abmag(tab[flux_col])
     use = np.isfinite(mag) & (mag <= float(args.maglim))
 
-    # World -> pixel in image WCS
     ra = np.asarray(tab["ra"][use], dtype=np.float64)
     dec = np.asarray(tab["dec"][use], dtype=np.float64)
     x, y = wcs.all_world2pix(ra, dec, 0)
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
 
-    # Keep a small boundary margin so near-edge objects still get drawn
     in_im = (x >= -5) & (x < nx + 5) & (y >= -5) & (y < ny + 5)
 
     x = x[in_im]
@@ -337,7 +541,6 @@ def main() -> None:
     mag_use = mag[use][in_im]
     t = tab["type"][use][in_im]
 
-    # Normalize type strings
     def _tostr(v) -> str:
         if isinstance(v, (bytes, np.bytes_)):
             return v.decode("utf-8", errors="ignore").strip()
@@ -365,8 +568,9 @@ def main() -> None:
     pixscale = float(args.pixscale_arcsec)
     n_star = 0
     n_gal = 0
+    n_gaia = 0
 
-    # First pass: stars
+    # First pass: Tractor PSF sources
     if not args.galaxies_only:
         is_star = tstr == "PSF"
         xs = x[is_star]
@@ -377,18 +581,13 @@ def main() -> None:
             if xi < -50 or xi > nx + 50 or yi < -50 or yi > ny + 50:
                 continue
 
-            # Star radius from psfsize map if provided; else fallback
-            if psf_map is not None:
-                xip = int(np.clip(round(xi), 0, nx - 1))
-                yip = int(np.clip(round(yi), 0, ny - 1))
-                fwhm_arcsec = float(psf_map[yip, xip])
-                if not np.isfinite(fwhm_arcsec) or fwhm_arcsec <= 0:
-                    fwhm_arcsec = 1.3
-            else:
-                fwhm_arcsec = 1.3
-
+            fwhm_arcsec = fwhm_arcsec_at_position(psf_map, xi, yi, nx, ny)
             fwhm_pix = fwhm_arcsec / pixscale
-            r_base = max(float(args.star_rmin_pix), float(args.star_kfwhm) * fwhm_pix)
+
+            r_base = max(
+                float(args.star_rmin_pix),
+                float(args.star_kfwhm) * fwhm_pix,
+            )
 
             mag_fac = star_radius_factor(
                 mi,
@@ -402,7 +601,7 @@ def main() -> None:
             draw_disk(mask, xi, yi, r, int(args.mask_value))
             n_star += 1
 
-    # Second pass: extended sources
+    # Second pass: Tractor extended sources
     if not args.stars_only:
         nonpsf = tstr != "PSF"
         xg = x[nonpsf]
@@ -429,12 +628,15 @@ def main() -> None:
                     continue
 
                 q, theta = ellipse_params_from_e1e2(e1, e2)
-                a = max(float(args.gal_amin_pix), float(args.gal_kre) * (rr / pixscale))
+                a = max(
+                    float(args.gal_amin_pix),
+                    float(args.gal_kre) * (rr / pixscale),
+                )
                 b = max(1.0, a * q)
+
                 draw_ellipse(mask, xi, yi, a, b, theta, int(args.mask_value))
                 n_gal += 1
         else:
-            # No shape columns: fall back to circles
             rgal = float(args.gal_amin_pix)
             for xi, yi in zip(xg, yg):
                 if xi < -50 or xi > nx + 50 or yi < -50 or yi > ny + 50:
@@ -442,7 +644,54 @@ def main() -> None:
                 draw_disk(mask, xi, yi, rgal, int(args.mask_value))
                 n_gal += 1
 
-    # Apply keep circles by resetting those pixels to 0
+    # Third pass: Gaia sources
+    if args.gaia is not None and not args.galaxies_only:
+        gaia_kfwhm = args.gaia_kfwhm
+        if gaia_kfwhm is None:
+            gaia_kfwhm = args.star_kfwhm
+
+        gaia_rmin_pix = args.gaia_rmin_pix
+        if gaia_rmin_pix is None:
+            gaia_rmin_pix = args.star_rmin_pix
+
+        gaia_mag_scale = args.gaia_mag_scale
+        if gaia_mag_scale is None:
+            gaia_mag_scale = args.star_mag_scale
+
+        gaia_mag_alpha = args.gaia_mag_alpha
+        if gaia_mag_alpha is None:
+            gaia_mag_alpha = args.star_mag_alpha
+
+        gaia_mag_max_factor = args.gaia_mag_max_factor
+        if gaia_mag_max_factor is None:
+            gaia_mag_max_factor = args.star_mag_max_factor
+
+        gaia_mask_value = args.gaia_mask_value
+        if gaia_mask_value is None:
+            gaia_mask_value = args.mask_value
+
+        n_gaia = draw_gaia_sources(
+            mask=mask,
+            wcs=wcs,
+            psf_map=psf_map,
+            gaia_path=args.gaia,
+            gaia_hdu=args.gaia_hdu,
+            ra_col_req=args.gaia_ra_col,
+            dec_col_req=args.gaia_dec_col,
+            mag_col_req=args.gaia_mag_col,
+            maglim=args.gaia_maglim,
+            pixscale_arcsec=pixscale,
+            kfwhm=float(gaia_kfwhm),
+            rmin_pix=float(gaia_rmin_pix),
+            mag_scale=str(gaia_mag_scale),
+            mag_alpha=float(gaia_mag_alpha),
+            mag_max_factor=float(gaia_mag_max_factor),
+            extra_radius_pix=float(args.gaia_extra_radius_pix),
+            mask_value=int(gaia_mask_value),
+            edge_margin_pix=float(args.gaia_edge_margin_pix),
+        )
+
+    # Apply keep circles after all masking
     for xc, yc, rc in keep_circles:
         x0 = max(int(np.floor(xc - rc)), 0)
         x1 = min(int(np.ceil(xc + rc)) + 1, nx)
@@ -457,7 +706,18 @@ def main() -> None:
         sub[sel] = 0
 
     # Write FITS
-    hdu = fits.PrimaryHDU(data=mask.astype(np.uint8), header=hdr)
+    out_hdr = hdr.copy()
+    out_hdr["MASKAUTO"] = (True, "Generated by auto_mask_from_tractor.py")
+    out_hdr["TRACTOR"] = (str(args.tractor.name), "Tractor catalog")
+    out_hdr["MAGLIM"] = (float(args.maglim), f"Tractor {args.band}-band mag limit")
+    if args.gaia is not None:
+        out_hdr["GAIAMASK"] = (True, "Gaia sources included")
+        out_hdr["GAIAFILE"] = (str(args.gaia.name), "Gaia source catalog")
+        out_hdr["GAIAMAGL"] = (float(args.gaia_maglim), "Gaia G mag limit")
+    else:
+        out_hdr["GAIAMASK"] = (False, "Gaia sources not included")
+
+    hdu = fits.PrimaryHDU(data=mask.astype(np.uint8), header=out_hdr)
     hdu.writeto(args.out_maskbits, overwrite=True)
 
     masked_pixels = int(np.count_nonzero(mask))
@@ -466,14 +726,23 @@ def main() -> None:
         f"Masked pixels: {masked_pixels} / {mask.size} "
         f"({100.0 * masked_pixels / mask.size:.2f}%)"
     )
+
     if args.stars_only:
-        print(f"Stars masked: {n_star} (galaxies skipped)")
+        print(f"Tractor stars masked: {n_star}")
+        print(f"Tractor galaxies skipped")
     elif args.galaxies_only:
-        print(f"Galaxies masked: {n_gal} (stars skipped)")
+        print(f"Tractor galaxies masked: {n_gal}")
+        print(f"Tractor stars skipped")
+        print(f"Gaia sources skipped")
     else:
-        print(f"Stars masked: {n_star}")
-        print(f"Galaxies masked: {n_gal}")
-    print("Note: output is a simple 0/1-style mask; treat any nonzero as masked.")
+        print(f"Tractor stars masked: {n_star}")
+        print(f"Tractor galaxies masked: {n_gal}")
+
+    if args.gaia is not None and not args.galaxies_only:
+        print(f"Gaia sources masked: {n_gaia}")
+
+    print("Note: output is a simple 0/nonzero mask; treat any nonzero as masked.")
+    print("Note: Gaia counts may overlap Tractor PSF sources; duplicates are harmless.")
 
 
 if __name__ == "__main__":
