@@ -26,6 +26,7 @@ Example:
 """
 
 import argparse
+import csv
 import math
 import sys
 
@@ -304,6 +305,26 @@ def write_check_fits(
     fits.HDUList(hdus).writeto(outpath, overwrite=True)
 
 
+def write_summary_csv(outpath, row):
+    """
+    Write a one-row CSV summary for this run.
+    If the file does not exist yet, write a header first.
+    """
+    fieldnames = list(row.keys())
+
+    try:
+        with open(outpath, "r", newline="") as f:
+            has_header = True
+    except FileNotFoundError:
+        has_header = False
+
+    with open(outpath, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not has_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Measure mean surface brightness in a DS9 region from mu_from_nmgy.py output, excluding a supplied mask."
@@ -321,6 +342,11 @@ def main():
         "--mask-hdu",
         default=None,
         help="Mask HDU index or EXTNAME (default: first image HDU in mask FITS).",
+    )
+    ap.add_argument(
+        "--summary-csv",
+        default=None,
+        help="Optional CSV file to append a one-line summary of the measurement.",
     )
     ap.add_argument(
         "--write-check-fits",
@@ -438,6 +464,49 @@ def main():
         mu_err_emp = np.nan
         rand_sb_mean = np.nan
         nrand_ok = int(rand_flux_sums.size)
+
+    # Preferred quoted uncertainties
+    quoted_sb_err = sb_err_emp if np.isfinite(sb_err_emp) else sb_err_naive
+    quoted_mu_err = mu_err_emp if np.isfinite(mu_err_emp) else mu_err_naive
+    quoted_err_source = (
+        "empirical_random_apertures"
+        if np.isfinite(sb_err_emp)
+        else "naive_sigma_clipped_sky" if np.isfinite(sb_err_naive) else "unavailable"
+    )
+
+    summary_row = {
+        "mu_fits": args.mu_fits,
+        "region_file": args.region_file,
+        "mask_fits": args.mask_fits,
+        "flux_hdu": args.flux_hdu,
+        "mask_hdu": args.mask_hdu if args.mask_hdu is not None else "first data HDU",
+        "subpixels": args.subpixels,
+        "nrand_requested": args.nrand,
+        "nrand_used": nrand_ok,
+        "seed": args.seed,
+        "pixel_area_arcsec2": pix_area,
+        "weighted_unmasked_area_arcsec2": area_arcsec2,
+        "equivalent_pixels": sumw,
+        "flux_sum_nmgy": flux_sum_nmgy,
+        "mean_sb_nmgy_arcsec2": sb_nmgy_arcsec2,
+        "mean_sb_mag_arcsec2": mu_mag_arcsec2,
+        "sky_sigma_pix_nmgy": sky_sigma_pix,
+        "sky_mean_nmgy": sky_mean,
+        "sky_median_nmgy": sky_med,
+        "naive_sb_err_nmgy_arcsec2": sb_err_naive,
+        "naive_mag_err": mu_err_naive,
+        "rand_ap_mean_sb_nmgy_arcsec2": rand_sb_mean,
+        "empirical_sb_err_nmgy_arcsec2": sb_err_emp,
+        "empirical_mag_err": mu_err_emp,
+        "quoted_sb_err_nmgy_arcsec2": quoted_sb_err,
+        "quoted_mag_err": quoted_mu_err,
+        "quoted_error_source": quoted_err_source,
+    }
+
+    if args.summary_csv is not None:
+        write_summary_csv(args.summary_csv, summary_row)
+        print()
+        print(f"Wrote summary CSV:        {args.summary_csv}")
 
     print()
     print("=== Region surface brightness measurement ===")
