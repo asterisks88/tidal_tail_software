@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Elliptical/S0 luminous mass & M200 from SDSS g,r & z (Astropy)
+Elliptical/S0 luminous mass & M200 from SDSS/DES g,r & z (Astropy)
 
 Formatting rules:
-- Msun/Lsun fields: scientific notation strings with 3 significant figures (e.g., "1.23e+12").
-- Magnitudes & colors (g, r, K-corr, M_r, solar M_r, (g-r), etc.): 5 significant figures, fixed notation.
+- Msun/Lsun fields: scientific notation strings with 3 significant figures.
+- Magnitudes & colors: 5 significant figures, fixed notation.
 - All other numbers: 3 significant figures, fixed notation.
 
-All physics features from prior version are preserved.
+This version adds Monte Carlo uncertainty propagation for:
+  g,r,z -> K_g,K_r -> (g-r)_0 -> M_r -> L_r -> M/L_r -> M_star
+
+It reports:
+  - photometric_only uncertainties
+  - with_systematic uncertainties (optional M/L systematic floor)
+
+Also fixes:
+  - bad halo_structure_from_M200(...) call in the Moster branch
+  - human-readable print block referencing missing icl_details
 """
 
 import argparse
@@ -17,12 +26,10 @@ import copy
 import json
 import math
 import os
-from pathlib import Path
 from typing import Any, List, Optional
 
 import astropy.units as u
 import numpy as np
-from astropy.constants import G
 from astropy.cosmology import FlatLambdaCDM, Planck18
 
 
@@ -33,13 +40,6 @@ def sci3(x: Any) -> str:
         return f"{float(x):.2e}"
     except Exception:
         return str(x)
-
-
-def _round_sig(x: float, sig: int) -> float:
-    if not np.isfinite(x) or x == 0:
-        return 0.0 if x == 0 else float(x)
-    p = sig - 1 - int(math.floor(math.log10(abs(x))))
-    return round(x, p)
 
 
 def sig_noexp_str(x: Any, sig: int) -> str:
@@ -65,12 +65,13 @@ def mag5_noexp_str(x: Any) -> str:
     return sig_noexp_str(x, 5)
 
 
-def key_is_msun_or_lsun(key: str) -> bool:
+def key_is_msun_or_lsun(key: Optional[str]) -> bool:
+    if key is None:
+        return False
     kl = key.lower()
     return ("msun" in kl) or ("lsun" in kl) or ("l_sun" in kl)
 
 
-# Treat these as magnitude/color fields
 _MAG_KEYS_EXPLICIT = {
     "g",
     "r",
@@ -84,74 +85,84 @@ _MAG_KEYS_EXPLICIT = {
     "M_u_mag",
     "M_r_sun_mag",
     "(g-r)_0",
+    "g_minus_r_0",
     "g_minus_r_obs",
     "Kg_mag",
     "Kr_mag",
 }
 
 
-def key_is_magnitude_like(key: str) -> bool:
+def key_is_magnitude_like(key: Optional[str]) -> bool:
+    if key is None:
+        return False
     kl = key.lower()
     return ("mag" in kl) or (key in _MAG_KEYS_EXPLICIT)
 
 
-def key_is_position_like(key: str) -> bool:
+def key_is_position_like(key: Optional[str]) -> bool:
+    if key is None:
+        return False
     kl = key.lower()
     return kl in ["ra", "dec"]
 
 
-def format_msun_lsun_inplace(obj: Any):
-    """Convert all Msun/Lsun fields to sci-3 strings."""
-    if isinstance(obj, dict):
-        for k, v in list(obj.items()):
-            if isinstance(v, (dict, list)):
-                format_msun_lsun_inplace(v)
-            else:
-                if (
-                    key_is_msun_or_lsun(k)
-                    and isinstance(v, (int, float, np.floating))
-                    and not isinstance(v, bool)
-                ):
-                    obj[k] = sci3(v)
-    elif isinstance(obj, list):
-        for i, v in enumerate(obj):
-            if isinstance(v, (dict, list)):
-                format_msun_lsun_inplace(v)
-
-
-def format_other_numbers_inplace(obj: Any):
+def _effective_format_key(
+    leaf_key: Optional[str], context_key: Optional[str]
+) -> Optional[str]:
     """
-    For all other numeric fields:
-      - magnitudes/colors: 5-sig fixed
-      - ra/dec: use input
-      - everything else: 3-sig fixed
+    For nested summary dicts like:
+      "M_star_Msun": {"p16": ..., "median": ...}
+    use the parent/context key to decide formatting.
+    """
+    if leaf_key is not None:
+        if (
+            key_is_msun_or_lsun(leaf_key)
+            or key_is_magnitude_like(leaf_key)
+            or key_is_position_like(leaf_key)
+        ):
+            return leaf_key
+    return context_key if context_key is not None else leaf_key
+
+
+def format_numbers_inplace(obj: Any, context_key: Optional[str] = None):
+    """
+    Recursively format numeric values.
+    Nested uncertainty summaries inherit formatting from their parent key.
     """
     if isinstance(obj, dict):
         for k, v in list(obj.items()):
             if isinstance(v, (dict, list)):
-                format_other_numbers_inplace(v)
+                format_numbers_inplace(v, context_key=k)
             else:
-                if (
-                    (not key_is_msun_or_lsun(k))
-                    and isinstance(v, (int, float, np.floating))
-                    and not isinstance(v, bool)
-                ):
-                    if key_is_position_like(k):
+                if isinstance(v, (int, float, np.floating)) and not isinstance(v, bool):
+                    use_key = _effective_format_key(k, context_key)
+                    if key_is_msun_or_lsun(use_key):
+                        obj[k] = sci3(v)
+                    elif key_is_position_like(use_key):
                         obj[k] = str(v)
+                    elif key_is_magnitude_like(use_key):
+                        obj[k] = mag5_noexp_str(v)
                     else:
-                        obj[k] = (
-                            mag5_noexp_str(v)
-                            if key_is_magnitude_like(k)
-                            else sig3_noexp_str(v)
-                        )
+                        obj[k] = sig3_noexp_str(v)
     elif isinstance(obj, list):
         for i, v in enumerate(obj):
             if isinstance(v, (dict, list)):
-                format_other_numbers_inplace(v)
+                format_numbers_inplace(v, context_key=context_key)
+            else:
+                if isinstance(v, (int, float, np.floating)) and not isinstance(v, bool):
+                    use_key = context_key
+                    if key_is_msun_or_lsun(use_key):
+                        obj[i] = sci3(v)
+                    elif key_is_position_like(use_key):
+                        obj[i] = str(v)
+                    elif key_is_magnitude_like(use_key):
+                        obj[i] = mag5_noexp_str(v)
+                    else:
+                        obj[i] = sig3_noexp_str(v)
 
 
 # ------------------ Chilingarian/Saulder K-corrections ------------------
-# From Saulder C., Mieske S., Zeilinger W. W., Chilingarian I., 2013, A&A, 557,A21
+# From Saulder C., Mieske S., Zeilinger W. W., Chilingarian I., 2013, A&A, 557, A21
 B_g: List[List[float]] = [
     [0.0, 0.0, 0.0, 0.0],
     [-2.45204, 4.10188, 10.5258, -13.5889],
@@ -185,7 +196,7 @@ def kpoly(z: float, color: float, coeffs: List[List[float]]) -> float:
 
 
 # ------------------ Color–M/L relations ------------------
-# All of these return Yr, the r band M/L from (g-r)
+# All of these return Y_r, the r-band M/L from (g-r)
 
 
 # From Zibetti S., Charlot S., Rix H.-W., 2009, MNRAS, 400, 1181
@@ -193,14 +204,181 @@ def mlr_zibetti2009_gr(color0: float) -> float:
     return 10.0 ** (-0.840 + 1.654 * color0)
 
 
-# Bell E. F., McIntosh D. H., Katz N., Weinberg M. D., 2003, Astrophysical Journal Supplement Series, 149, 289
+# Bell E. F., McIntosh D. H., Katz N., Weinberg M. D., 2003, ApJS, 149, 289
 def mlr_bell2003_diet_gr(color0: float) -> float:
     return 10.0 ** (-0.306 + 1.097 * color0)
 
 
-# Bell adjusted by 0.1dex for closer match to Chabrier
+# Bell adjusted by 0.1 dex for closer match to Chabrier
 def mlr_bell2003_chabrier_gr(color0: float) -> float:
     return mlr_bell2003_diet_gr(color0) / (10.0**0.10)
+
+
+def default_ml_systematic_dex(ml_mode: str) -> float:
+    """
+    Conservative defaults:
+      - zcr09: ~30% => log10(1.30) = 0.11394 dex
+      - Bell03 variants: 0.10 dex
+    """
+    if ml_mode == "zcr09":
+        return math.log10(1.30)
+    return 0.10
+
+
+def compute_restframe_quantities(g, r, z, ml_mode: str, M_r_sun: float, cosmo):
+    """
+    Vectorized helper:
+      g,r,z -> K_g,K_r,(g-r)_0,M_r,L_r,M/L_r,M_star
+    """
+    g = np.asarray(g, dtype=float)
+    r = np.asarray(r, dtype=float)
+    z = np.asarray(z, dtype=float)
+
+    gmr_obs = g - r
+    Kg = kpoly(z, gmr_obs, B_g)
+    Kr = kpoly(z, gmr_obs, B_r)
+
+    g0 = g - Kg
+    r0 = r - Kr
+    gmr0 = g0 - r0
+
+    mu = cosmo.distmod(z).value
+    M_r = r0 - mu
+    Lr_Lsun = 10.0 ** (-0.4 * (M_r - M_r_sun))
+
+    if ml_mode == "zcr09":
+        ML = mlr_zibetti2009_gr(gmr0)
+    elif ml_mode == "bell03_chabrier":
+        ML = mlr_bell2003_chabrier_gr(gmr0)
+    else:
+        ML = mlr_bell2003_diet_gr(gmr0)
+
+    Mstar = ML * Lr_Lsun
+
+    return {
+        "gmr_obs": gmr_obs,
+        "Kg": Kg,
+        "Kr": Kr,
+        "gmr0": gmr0,
+        "M_r": M_r,
+        "Lr_Lsun": Lr_Lsun,
+        "ML": ML,
+        "Mstar": Mstar,
+    }
+
+
+def summarize_samples(samples, positive_only: bool = False) -> Optional[dict]:
+    x = np.asarray(samples, dtype=float)
+    good = np.isfinite(x)
+    if positive_only:
+        good &= x > 0
+    x = x[good]
+    if x.size == 0:
+        return None
+
+    p16, p50, p84 = np.percentile(x, [16, 50, 84])
+    out = {
+        "p16": float(p16),
+        "median": float(p50),
+        "p84": float(p84),
+        "err_minus": float(p50 - p16),
+        "err_plus": float(p84 - p50),
+        "std": float(np.std(x, ddof=1)) if x.size > 1 else 0.0,
+        "nsamp_used": int(x.size),
+    }
+
+    if positive_only:
+        lx = np.log10(x)
+        out["sigma_dex"] = float(np.std(lx, ddof=1)) if x.size > 1 else 0.0
+
+    return out
+
+
+def estimate_photometric_uncertainties_mc(
+    g: float,
+    r: float,
+    z: float,
+    ml_mode: str,
+    M_r_sun: float,
+    cosmo,
+    mstar_missing: float,
+    mhalo_missing: float,
+    g_err: Optional[float] = None,
+    r_err: Optional[float] = None,
+    z_err: Optional[float] = None,
+    nsamp: int = 5000,
+    systematic_dex: float = 0.0,
+    seed: Optional[int] = None,
+) -> dict:
+    """
+    Propagate g,r,z uncertainties through:
+      g,r,z -> K_g,K_r -> (g-r)_0 -> M_r -> L_r -> M/L_r -> M_star
+
+    Returns:
+      - photometric_only
+      - with_systematic   (if systematic_dex > 0)
+    """
+    rng = np.random.default_rng(seed)
+    nsamp = max(100, int(nsamp))
+
+    g_err = 0.0 if g_err is None else max(0.0, float(g_err))
+    r_err = 0.0 if r_err is None else max(0.0, float(r_err))
+    z_err = 0.0 if z_err is None else max(0.0, float(z_err))
+
+    gs = rng.normal(g, g_err, nsamp) if g_err > 0 else np.full(nsamp, g, dtype=float)
+    rs = rng.normal(r, r_err, nsamp) if r_err > 0 else np.full(nsamp, r, dtype=float)
+    zs = rng.normal(z, z_err, nsamp) if z_err > 0 else np.full(nsamp, z, dtype=float)
+
+    # Avoid z <= 0 causing pathological distance moduli
+    zs = np.clip(zs, 1.0e-8, None)
+
+    base = compute_restframe_quantities(gs, rs, zs, ml_mode, M_r_sun, cosmo)
+
+    phot = {
+        "g_minus_r_0": summarize_samples(base["gmr0"], positive_only=False),
+        "M_r_mag": summarize_samples(base["M_r"], positive_only=False),
+        "L_r_Lsun": summarize_samples(base["Lr_Lsun"], positive_only=True),
+        "M_over_L_r": summarize_samples(base["ML"], positive_only=True),
+        "M_star_Msun": summarize_samples(
+            base["Mstar"] * mhalo_missing, positive_only=True
+        ),
+        "M_star_Msun_with_missing": summarize_samples(
+            base["Mstar"] * mstar_missing, positive_only=True
+        ),
+    }
+
+    out = {
+        "method": "monte_carlo",
+        "inputs": {
+            "g_err_mag": g_err,
+            "r_err_mag": r_err,
+            "z_err": z_err,
+            "systematic_dex": float(systematic_dex),
+            "nsamp": nsamp,
+            "seed": seed,
+        },
+        "photometric_only": phot,
+    }
+
+    if systematic_dex > 0:
+        sys_factor = 10.0 ** rng.normal(0.0, systematic_dex, nsamp)
+        ML_sys = base["ML"] * sys_factor
+        Mstar_sys = ML_sys * base["Lr_Lsun"]
+
+        out["with_systematic"] = {
+            "g_minus_r_0": summarize_samples(base["gmr0"], positive_only=False),
+            "M_r_mag": summarize_samples(base["M_r"], positive_only=False),
+            "L_r_Lsun": summarize_samples(base["Lr_Lsun"], positive_only=True),
+            "M_over_L_r": summarize_samples(ML_sys, positive_only=True),
+            "M_star_Msun": summarize_samples(
+                Mstar_sys * mhalo_missing, positive_only=True
+            ),
+            "M_star_Msun_with_missing": summarize_samples(
+                Mstar_sys * mstar_missing, positive_only=True
+            ),
+        }
+
+    return out
 
 
 # ------------------ Moster+2013 SHMR and inversion ------------------
@@ -235,18 +413,17 @@ def load_umachine_smhm(z: float, galaxy_type: str) -> list[list]:
     upath_str = os.environ.get(
         "UMACHINE_PATH", os.path.join(os.environ.get("HOME", ""), "umachine-dr1")
     )
-    # These files come from the UniverseMachine DR1
     param_files = {
         "all": os.path.join(upath_str, "data/smhm/params/smhm_med_params.txt"),
         "host": os.path.join(upath_str, "data/smhm/params/smhm_med_cen_params.txt"),
         "sat": os.path.join(upath_str, "data/smhm/params/smhm_med_sat_params.txt"),
     }
-    # This code from gen_smhm.py from UniverseMachine DR1
-    # -----------------------------------------------------
-    param_file = open(param_files[galaxy_type], "r")
-    param_list = []
-    for line in param_file:
-        param_list.append(float((line.split(" "))[1]))
+
+    with open(param_files[galaxy_type], "r") as param_file:
+        param_list = []
+        for line in param_file:
+            param_list.append(float((line.split(" "))[1]))
+
     names = "EFF_0 EFF_0_A EFF_0_A2 EFF_0_Z M_1 M_1_A M_1_A2 M_1_Z ALPHA ALPHA_A ALPHA_A2 ALPHA_Z BETA BETA_A BETA_Z DELTA GAMMA GAMMA_A GAMMA_Z CHI2".split(
         " "
     )
@@ -295,8 +472,8 @@ def load_umachine_smhm(z: float, galaxy_type: str) -> list[list]:
 
 
 def _interp_loglog(x, xy):
-    xs = [x[0] for x in xy]
-    ys = [x[1] for x in xy]
+    xs = [row[0] for row in xy]
+    ys = [row[1] for row in xy]
     lx = np.log10(x)
     if lx <= xs[0]:
         m = (ys[1] - ys[0]) / (xs[1] - xs[0])
@@ -308,16 +485,12 @@ def _interp_loglog(x, xy):
 
 
 def m200_um_median(Mstar: float, z: float, galaxy_type: str) -> float:
-
     umachine_smhm = load_umachine_smhm(z, galaxy_type)
-
     return _interp_loglog(Mstar, umachine_smhm)
 
 
 # ------------------ (R200, M200) helpers ------------------
 # From Mo H. J., Mao S., White S. D. M., 1998, MNRAS, 295, 319
-
-
 def r200_from_m200(M200: float, z: float, cosmo) -> u.Quantity:
     rho_c = cosmo.critical_density(z).to(u.Msun / u.Mpc**3).value
     return ((3.0 * M200) / (4.0 * np.pi * 200.0 * rho_c)) ** (1.0 / 3.0) * u.Mpc
@@ -329,17 +502,12 @@ def v200_from_m200(M200: float, z: float, cosmo) -> u.Quantity:
 
 
 # ------------------ NFW mass & concentration; Re-based fit ------------------
-
-
 def c200_from_m200_dutton2014(M200: float, h: float) -> float:
-    # a = 0.905 and b = -0.101 from Dutton A. A., Macciò A. V., 2014, MNRAS, 441, 3359
     # log10 c200 = a + b * log10( M200 / (1e12 h^-1 Msun) )
     return 10.0 ** (0.905 + -0.101 * math.log10(M200 * h / 1.0e12))
 
 
 def c200_from_m200_wang2022(M200: float, h: float) -> float:
-    # Gu Q., Guo Q., Zhang T., Wang W., Guo Q., Gao L., 2022, Research in
-    # Astronomy and Astrophysics, 22, 125015
     # log10 c200 = a + b * log10( M200 / (h^-1 Msun) )
     return 10.0 ** (2.161 + -0.105 * math.log10(M200 * h))
 
@@ -374,7 +542,7 @@ def hernquist_a_from_Re(Re_kpc: float) -> float:
 def halo_structure_from_M200(
     M200: float, z: float, cosmo, c_input: Optional[float]
 ) -> dict:
-    R200 = r200_from_m200(M200, z, cosmo)  # Mpc
+    R200 = r200_from_m200(M200, z, cosmo)
     R200_kpc = R200.to_value(u.kpc)
     H0 = cosmo.H0.value
     h = H0 / 100.0
@@ -383,7 +551,7 @@ def halo_structure_from_M200(
     else:
         c_used = float(c200_from_m200_wang2022(M200, h))
     rs = (R200 / c_used).to(u.kpc)
-    a_halo = a_halo_from_c_rs(rs, c_used)  # kpc
+    a_halo = a_halo_from_c_rs(rs, c_used)
     return {
         "R200_kpc": R200_kpc,
         "c_used": c_used,
@@ -435,7 +603,7 @@ def load_input_dict(path: str) -> dict:
 # ------------------ Main ------------------
 def main():
     ap = argparse.ArgumentParser(
-        description="Estimate stellar mass and M200 (Astropy). ICL prior; D/T; bulge+disk M(<Re). Msun/Lsun sci-3; mags 5-sig; others 3-sig.",
+        description="Estimate stellar mass and M200 (Astropy). Includes MC uncertainty propagation for color, M/L, luminosity, and stellar mass.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     ap.add_argument("input_file", type=str, help="Path to file with the input dict")
@@ -494,7 +662,7 @@ def main():
     ap.add_argument(
         "--um_scatter_dex",
         type=float,
-        default=0.25,  # Adopted Figure 12, Behroozi P., Wechsler R. H., Hearin A. P., Conroy C., 2019, MNRAS, 488, 289
+        default=0.25,
         help="1σ log10 scatter for 'umachine' (report only)",
     )
     ap.add_argument(
@@ -513,23 +681,82 @@ def main():
         "--missing_stellar",
         type=float,
         default=None,
-        help="Missing Stellar Mass Overide",
+        help="Missing stellar mass override",
     )
     ap.add_argument(
         "--missing_halo",
         type=float,
         default=None,
-        help="Missing Halo Mass Overide",
+        help="Missing halo mass override",
     )
+
+    # Optional photometric / redshift uncertainties
+    ap.add_argument(
+        "--g_err",
+        type=float,
+        default=None,
+        help="1σ uncertainty in g magnitude [mag]. If omitted, use input dict key 'g_err' if present.",
+    )
+    ap.add_argument(
+        "--r_err",
+        type=float,
+        default=None,
+        help="1σ uncertainty in r magnitude [mag]. If omitted, use input dict key 'r_err' if present.",
+    )
+    ap.add_argument(
+        "--z_err",
+        type=float,
+        default=None,
+        help="1σ uncertainty in redshift. If omitted, use input dict key 'z_err' if present.",
+    )
+    ap.add_argument(
+        "--ml_mc_samples",
+        type=int,
+        default=5000,
+        help="Number of Monte Carlo draws for uncertainty propagation.",
+    )
+    ap.add_argument(
+        "--ml_mc_seed",
+        type=int,
+        default=12345,
+        help="Random seed for Monte Carlo uncertainty propagation.",
+    )
+    ap.add_argument(
+        "--ml_systematic_dex",
+        type=float,
+        default=None,
+        help=(
+            "Additional systematic scatter in log10(M/L). "
+            "Default: 0.114 dex for zcr09, 0.10 dex for Bell03 variants. "
+            "Set to 0 to disable."
+        ),
+    )
+
     args = ap.parse_args()
 
     # --- Load input dict ---
     d = load_input_dict(args.input_file)
+
+    def pick_optional_float(cli_value, dict_key):
+        v = cli_value if cli_value is not None else d.get(dict_key, None)
+        return None if v is None else float(v)
+
     z = float(d["z"])
     g = float(d["g"])
     r = float(d["r"])
     ra = float(d["ra"])
     dec = float(d["dec"])
+
+    g_err = pick_optional_float(args.g_err, "g_err")
+    r_err = pick_optional_float(args.r_err, "r_err")
+    z_err_in = pick_optional_float(args.z_err, "z_err")
+
+    ml_systematic_dex = (
+        default_ml_systematic_dex(args.ml)
+        if args.ml_systematic_dex is None
+        else float(args.ml_systematic_dex)
+    )
+
     Re_arcsec = float(d.get("Reff_r_arcsec", np.nan))
     sersic_n = float(d.get("sersic_n", 4.0))
     a_pix = d.get("A_pix", None)
@@ -537,16 +764,19 @@ def main():
     b_over_a_raw = None if a_pix is None or b_pix is None else b_pix / a_pix
     b_over_a = None if b_over_a_raw is None else float(b_over_a_raw)
     a_over_b = None if (b_over_a is None or b_over_a <= 0) else 1.0 / b_over_a
+
     DT_raw = d.get("D/T", d.get("D_over_T", 0.0))
     DT = float(max(0.0, min(1.0, DT_raw if DT_raw is not None else 0.0)))
+
     if args.missing_stellar is None:
-        mstar_missing = d.get("mstar_missing", 1.0)
+        mstar_missing = float(d.get("mstar_missing", 1.0))
     else:
-        mstar_missing = args.missing_stellar
+        mstar_missing = float(args.missing_stellar)
+
     if args.missing_halo is None:
-        mhalo_missing = d.get("mhalo_missing", 1.0)
+        mhalo_missing = float(d.get("mhalo_missing", 1.0))
     else:
-        mhalo_missing = args.missing_halo
+        mhalo_missing = float(args.missing_halo)
 
     if args.c200 is None:
         c_input = d.get("c", d.get("c200", None))
@@ -557,6 +787,7 @@ def main():
                 c_input = None
     else:
         c_input = args.c200
+
     Re_bulge_arcsec = d.get("Re_bulge_arcsec", None)
     Re_disk_arcsec = d.get("Re_disk_arcsec", None)
     Rd_exp_arcsec = d.get("Rd_exp_arcsec", None)
@@ -594,12 +825,27 @@ def main():
     else:
         ML = mlr_bell2003_diet_gr(gmr0)
         ml_name = "Bell+2003 (diet Salpeter)"
-    Mstar_Msun = ML * Lr_Lsun
-    # Make mstar_missing = mhalo_missing to make median halo mass match luminous estimate
-    # Mstar figure used to compute luminous mass
-    Mstar_Msun_with_stripped = Mstar_Msun * mstar_missing
-    # Mstar figure used to compute halo mass
-    Mstar_Msun = Mstar_Msun * mhalo_missing
+
+    Mstar_base_Msun = ML * Lr_Lsun
+    Mstar_Msun_with_stripped = Mstar_base_Msun * mstar_missing
+    Mstar_Msun = Mstar_base_Msun * mhalo_missing
+
+    uncertainty_mc = estimate_photometric_uncertainties_mc(
+        g=g,
+        r=r,
+        z=z,
+        ml_mode=args.ml,
+        M_r_sun=args.M_r_sun,
+        cosmo=cosmo,
+        mstar_missing=mstar_missing,
+        mhalo_missing=mhalo_missing,
+        g_err=g_err,
+        r_err=r_err,
+        z_err=z_err_in,
+        nsamp=args.ml_mc_samples,
+        systematic_dex=ml_systematic_dex,
+        seed=args.ml_mc_seed,
+    )
 
     # --- Disk/Bulge split ---
     Mdisk_Msun = Mstar_Msun_with_stripped * DT
@@ -621,6 +867,7 @@ def main():
     Re_bulge_arcsec = (
         float(Re_bulge_arcsec) if Re_bulge_arcsec is not None else float("nan")
     )
+
     if Rd_exp_arcsec is not None:
         h_disk_arcsec = float(Rd_exp_arcsec)
         Re_disk_arcsec_used = 1.678 * h_disk_arcsec
@@ -669,12 +916,13 @@ def main():
                 "Mdisk_over_M200": (Mdisk_Msun / M200) if M200 > 0 else None,
             }
         )
-        hs = halo_structure_from_M200(M200, z, cosmo, c_input, args.c_a, args.c_b)
+        hs = halo_structure_from_M200(M200, z, cosmo, c_input)
         shmr["halo_structure"] = hs
         shmr["a_bulge_kpc"] = a_bulge_kpc
         shmr["a_bulge_over_a_halo"] = (
             (a_bulge_kpc / hs["a_halo_kpc"]) if np.isfinite(a_bulge_kpc) else None
         )
+
     elif args.shmr_model == "umachine":
         med = m200_um_median(Mstar_eff, z, args.gal_type) * (10.0**args.shmr_shift_dex)
         scatter = max(0.0, args.um_scatter_dex)
@@ -723,14 +971,14 @@ def main():
         shmr["a_bulge_over_a_halo_p84"] = (
             (a_bulge_kpc / hs_p84["a_halo_kpc"]) if np.isfinite(a_bulge_kpc) else None
         )
+
     else:
         med = 1.5e12
-        # TODO: This is all code the same as umachine, need to consolidate
         scatter = max(0.0, args.um_scatter_dex)
         p16, p84 = med / (10.0**scatter), med * (10.0**scatter)
         shmr.update(
             {
-                "model": "UM/lensing (z~0)",
+                "model": "Fixed M200",
                 "M200c_median_Msun": med,
                 "M200c_p16_Msun": p16,
                 "M200c_p84_Msun": p84,
@@ -773,6 +1021,7 @@ def main():
         if cosmo is Planck18
         else f"FlatLambdaCDM(H0={cosmo.H0.value:.3f}, Om0={cosmo.Om0:.3f})"
     )
+
     out = {
         "inputs": {
             "ra": ra,
@@ -780,6 +1029,9 @@ def main():
             "z": z,
             "g": g,
             "r": r,
+            "g_err": g_err,
+            "r_err": r_err,
+            "z_err": z_err_in,
             "dereddened": True,
             "Reff_r_arcsec": (
                 None if not np.isfinite(Re_gal_arcsec) else float(Re_gal_arcsec)
@@ -789,11 +1041,7 @@ def main():
             ),
             "Re_disk_arcsec": (
                 None
-                if not np.isfinite(
-                    Re_disk_arcsec_used := (
-                        Re_disk_arcsec if Re_disk_arcsec is not None else float("nan")
-                    )
-                )
+                if not np.isfinite(Re_disk_arcsec_used)
                 else float(Re_disk_arcsec_used)
             ),
             "Rd_exp_arcsec": (
@@ -819,25 +1067,28 @@ def main():
             "D_over_T": DT,
             "M_bulge_Msun": Mbulge_Msun,
             "M_disk_Msun": Mdisk_Msun,
+            "uncertainty_mc": uncertainty_mc,
         },
         "halo_mass_SHMR": shmr,
     }
 
     # ------------------ Print (human-readable) ------------------
-    # Formatters
     s3 = sig3_noexp_str
     s5 = mag5_noexp_str
 
     if args.json:
         out_fmt = copy.deepcopy(out)
-        # First convert Msun/Lsun fields
-        format_msun_lsun_inplace(out_fmt)
-        # Then format the rest: magnitudes 5-sig, others 3-sig
-        format_other_numbers_inplace(out_fmt)
+        format_numbers_inplace(out_fmt)
         print(json.dumps(out_fmt, indent=2))
     else:
         print("\n=== Inputs ===")
         print(f"z = {s3(z)}, g = {s5(g)}, r = {s5(r)}  (dereddened)")
+        if g_err is not None or r_err is not None or z_err_in is not None:
+            print(
+                f"input uncertainties: g_err = {s3(g_err) if g_err is not None else 'None'} mag, "
+                f"r_err = {s3(r_err) if r_err is not None else 'None'} mag, "
+                f"z_err = {s3(z_err_in) if z_err_in is not None else 'None'}"
+            )
         if np.isfinite(Re_gal_arcsec):
             print(f"Reff_r (galaxy) = {s3(Re_gal_arcsec)} arcsec")
         if np.isfinite(Re_bulge_arcsec):
@@ -846,8 +1097,8 @@ def main():
             print(
                 f"Rd_exp (disk scale h) = {s3(h_disk_arcsec)} arcsec  (Re_disk ≈ {s3(1.678 * h_disk_arcsec)} arcsec)"
             )
-        elif Re_disk_arcsec is not None:
-            print(f"Re_disk = {s3(float(Re_disk_arcsec))} arcsec")
+        elif np.isfinite(Re_disk_arcsec_used):
+            print(f"Re_disk = {s3(Re_disk_arcsec_used)} arcsec")
         print(f"Sérsic n (bulge) = {s3(sersic_n)}")
         if b_over_a is not None:
             print(f"b/a = {s3(b_over_a)}  →  a/b = {s3(a_over_b)}")
@@ -875,19 +1126,55 @@ def main():
             f"Re_ap for dynamics = {s3(Re_ap_arcsec)} arcsec ({s3(Re_ap_kpc)} kpc) [{Re_ap_reason}]"
         )
 
+        umc = out["stellar_mass"].get("uncertainty_mc", None)
+        if umc is not None:
+            print("\n=== Monte Carlo uncertainty propagation ===")
+            up = umc.get("photometric_only", {})
+            cp = up.get("g_minus_r_0", None)
+            lp = up.get("L_r_Lsun", None)
+            mlp = up.get("M_over_L_r", None)
+            mp = up.get("M_star_Msun", None)
+
+            if cp is not None:
+                print(
+                    f"(g-r)_0 photometric 68% = {s5(cp['p16'])} – {s5(cp['p84'])}  "
+                    f"(median={s5(cp['median'])})"
+                )
+            if lp is not None:
+                print(
+                    f"L_r photometric 68% = {sci3(lp['p16'])} – {sci3(lp['p84'])}  "
+                    f"(median={sci3(lp['median'])})"
+                )
+            if mlp is not None:
+                print(
+                    f"M/L_r photometric 68% = {s3(mlp['p16'])} – {s3(mlp['p84'])}  "
+                    f"(median={s3(mlp['median'])}, sigma_log10={s3(mlp['sigma_dex'])} dex)"
+                )
+            if mp is not None:
+                print(
+                    f"M_star photometric 68% = {sci3(mp['p16'])} – {sci3(mp['p84'])}  "
+                    f"(median={sci3(mp['median'])}, sigma_log10={s3(mp['sigma_dex'])} dex)"
+                )
+
+            uts = umc.get("with_systematic", {})
+            mls = uts.get("M_over_L_r", None)
+            ms = uts.get("M_star_Msun", None)
+            if mls is not None:
+                print(
+                    f"M/L_r with systematic ({s3(ml_systematic_dex)} dex) 68% = "
+                    f"{s3(mls['p16'])} – {s3(mls['p84'])}  "
+                    f"(median={s3(mls['median'])}, sigma_log10={s3(mls['sigma_dex'])} dex)"
+                )
+            if ms is not None:
+                print(
+                    f"M_star with systematic ({s3(ml_systematic_dex)} dex) 68% = "
+                    f"{sci3(ms['p16'])} – {sci3(ms['p84'])}  "
+                    f"(median={sci3(ms['median'])}, sigma_log10={s3(ms['sigma_dex'])} dex)"
+                )
+
         print("\n=== Halo mass from SHMR ===")
         s = out["halo_mass_SHMR"]
-        if s["icl_details"]["mode"] == "manual":
-            print(f"ICL: manual icl_frac = {s3(s['icl_used'])}")
-        elif s["icl_details"]["mode"] == "auto":
-            baseM = s["icl_details"].get("baseM200_for_prior", float("nan"))
-            i1 = s["icl_details"].get("icl1", float("nan"))
-            i2 = s["icl_details"].get("icl2", float("nan"))
-            print(
-                f"ICL: auto prior → icl_frac = {s3(s['icl_used'])}  (baseM={sci3(baseM)}, iter: {s3(i1)}→{s3(i2)})"
-            )
-        else:
-            print("ICL: off (icl_frac = 0.000)")
+        print(f"ICL fraction used for SHMR = {s3(s['icl_used'])}")
 
         if s["model"].startswith("Moster"):
             print(
@@ -900,13 +1187,15 @@ def main():
             if "halo_structure" in s:
                 hs = s["halo_structure"]
                 print(
-                    f"  R200 = {s3(hs['R200_kpc'])} kpc,  c = {s3(hs['c_used'])},  r_s = {s3(hs['r_s_kpc'])} kpc,  a_halo = {s3(hs['a_halo_kpc'])} kpc"
+                    f"  R200 = {s3(hs['R200_kpc'])} kpc,  c = {s3(hs['c_used'])},  "
+                    f"r_s = {s3(hs['r_s_kpc'])} kpc,  a_halo = {s3(hs['a_halo_kpc'])} kpc"
                 )
                 if np.isfinite(a_bulge_kpc):
                     print(f"  a_bulge/a_halo = {s3(s['a_bulge_over_a_halo'])}")
         else:
             print(
-                f"UM/lensing (median): M200c = {sci3(s['M200c_median_Msun'])} Msun,  V200 = {s3(s['V200_median_kms'])} km/s"
+                f"{s['model']} (median): M200c = {sci3(s['M200c_median_Msun'])} Msun,  "
+                f"V200 = {s3(s['V200_median_kms'])} km/s"
             )
             print(
                 f"  M*/M200 = {s3(s['Mstar_over_M200_median'])}  "
@@ -922,7 +1211,8 @@ def main():
             )
             hs = s["halo_structure_median"]
             print(
-                f"  R200 (median) = {s3(hs['R200_kpc'])} kpc,  c = {s3(hs['c_used'])},  r_s = {s3(hs['r_s_kpc'])} kpc,  a_halo = {s3(hs['a_halo_kpc'])} kpc"
+                f"  R200 (median) = {s3(hs['R200_kpc'])} kpc,  c = {s3(hs['c_used'])},  "
+                f"r_s = {s3(hs['r_s_kpc'])} kpc,  a_halo = {s3(hs['a_halo_kpc'])} kpc"
             )
             if np.isfinite(a_bulge_kpc):
                 print(
@@ -932,9 +1222,5 @@ def main():
 
 
 if __name__ == "__main__":
-    # There is a dependency on UniverseMachine DR1 if you use this as the shmr described in:
-    # Behroozi P., Wechsler R. H., Hearin A. P., Conroy C., 2019, MNRAS, 488, 289
-    #
-    # Download this from: https://www.peterbehroozi.com/data.html
-    #
+    # UniverseMachine DR1 is required if you use --shmr_model umachine
     main()
