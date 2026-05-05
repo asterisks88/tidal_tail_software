@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import csv
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -669,6 +670,21 @@ def save_ds9_region_fk5(path, points_pix, wcs, color="green"):
         f.write(f"segment({xy})\n")
 
 
+def append_summary_csv(path, row):
+    """
+    Append one summary row to a CSV file.
+    Writes the header if the file does not already exist.
+    """
+    path = Path(path)
+    write_header = (not path.exists()) or (path.stat().st_size == 0)
+
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 def main():
     p = argparse.ArgumentParser(
         description="Trace a satellite tidal tail centerline and fit a cubic spline."
@@ -891,6 +907,12 @@ def main():
         default="tail_trace",
         help="Output prefix for CSV/PNG/region products",
     )
+    p.add_argument(
+        "--summary-csv",
+        type=str,
+        default=None,
+        help="Optional CSV file to append a one-line summary of the trace results",
+    )
     args = p.parse_args()
 
     mu, hdr = read_fits_2d(args.fits, args.hdu)
@@ -1048,7 +1070,11 @@ def main():
         mean_weight=float(args.mean_weight),
         std_penalty=float(args.std_penalty),
     )
-    usable = component & np.isfinite(I) & (I > 0) & ~star_mask
+
+    usable = component & np.isfinite(I) & (I > 0)
+    if star_mask is not None:
+        usable &= ~star_mask
+
     if pts.shape[0] < 4:
         raise RuntimeError(
             f"Only traced {pts.shape[0]} points. "
@@ -1157,6 +1183,64 @@ def main():
     seg = np.hypot(np.diff(spline[:, 0]), np.diff(spline[:, 1]))
     length_pix = float(np.sum(seg))
     length_arcmin = length_pix * 0.262 * 4 / 60.0
+    # This script does not currently estimate a length uncertainty.
+    # Leave placeholders for later Monte Carlo / noise-realization errors.
+    length_err_pix = np.nan
+    length_err_arcmin = np.nan
+
+    summary_row = {
+        "input_fits": str(args.fits),
+        "hdu": str(args.hdu),
+        "out_prefix": str(args.out_prefix),
+        "seed_source": str(seed_source),
+        "x_seed_pix": int(x_seed),
+        "y_seed_pix": int(y_seed),
+        "start_x_pix": float(cx),
+        "start_y_pix": float(cy),
+        "traced_points": int(pts.shape[0]),
+        "spline_samples": int(spline.shape[0]),
+        "mu_max": float(args.mu_max),
+        "smooth_sigma_pix": float(args.smooth_sigma),
+        "close_iters": int(args.close_iters),
+        "seed_search_radius_pix": float(args.seed_search_radius),
+        "centroid_radius_pix": float(args.centroid_radius),
+        "core_exclusion_pix": float(args.core_exclusion),
+        "direction_radius_pix": float(args.direction_radius),
+        "theta0_deg": float(args.theta0) if args.theta0 is not None else np.nan,
+        "step_pix": float(args.step),
+        "direction_relax": float(args.direction_relax),
+        "min_move_pix": float(args.min_move),
+        "max_steps": int(args.max_steps),
+        "intensity_power": float(args.intensity_power),
+        "cap_percentile": (
+            float(args.cap_percentile) if args.cap_percentile is not None else np.nan
+        ),
+        "sigma_parallel_factor": float(args.sigma_parallel_factor),
+        "sigma_perp_factor": float(args.sigma_perp_factor),
+        "spline_s": float(args.spline_s),
+        "beam_width": int(args.beam_width),
+        "lookahead": int(args.lookahead),
+        "n_long_bins": int(args.n_long_bins),
+        "min_bin_frac": float(args.min_bin_frac),
+        "mean_weight": float(args.mean_weight),
+        "std_penalty": float(args.std_penalty),
+        "length_pix": float(length_pix),
+        "length_arcmin": float(length_arcmin),
+        "length_err_pix": float(length_err_pix),
+        "length_err_arcmin": float(length_err_arcmin),
+        "raw_pix_csv": str(raw_pix_csv),
+        "spline_pix_csv": str(spline_pix_csv),
+        "raw_world_csv": str(raw_world_csv) if wrote_world else "",
+        "spline_world_csv": str(spline_world_csv) if wrote_world else "",
+        "raw_image_reg": str(reg_raw_img),
+        "spline_image_reg": str(reg_spline_img),
+        "raw_fk5_reg": str(reg_raw_fk5) if wrote_fk5_reg else "",
+        "spline_fk5_reg": str(reg_spline_fk5) if wrote_fk5_reg else "",
+        "overlay_png": str(png_out),
+    }
+
+    if args.summary_csv is not None:
+        append_summary_csv(args.summary_csv, summary_row)
 
     print(f"Seed source: {seed_source}")
     print(f"Seed pixel used for component: ({x_seed}, {y_seed})")
@@ -1180,6 +1264,8 @@ def main():
     else:
         print("FK5 region files not written (missing/invalid celestial WCS).")
     print(f"Saved overlay PNG:        {png_out}")
+    if args.summary_csv is not None:
+        print(f"Saved summary CSV:        {args.summary_csv}")
 
 
 if __name__ == "__main__":
