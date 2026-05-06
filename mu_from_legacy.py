@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-mu_from_nmgy.py  —  Sky-subtract Legacy r (nMgy/pix) then convert to mag/arcsec^2,
+mu_from_legacy.py  —  Sky-subtract Legacy r (nMgy/pix) then convert to mag/arcsec^2,
 with optional smoothing in flux units BEFORE the SB conversion.
 
 Outputs a multi-product MEF:
