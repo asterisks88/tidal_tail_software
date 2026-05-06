@@ -7,6 +7,7 @@ Outputs a multi-product MEF:
   - DATA_NMGY, MASK, BKG_NMGY, SKY_SUB_NMGY
   - SKY_SUB_SMOOTH_NMGY (if smoothing enabled)
   - MU_OBS, MU_REST (if --z provided)
+  - Optional standalone background FITS via --out-background-fits
 
 Requires: astropy, photutils; (optional) scipy for mask dilation fallback.
 
@@ -432,6 +433,17 @@ def main():
         help="Print effective area and expected SB gain for the smoothing kernel.",
     )
 
+
+    ap.add_argument(
+        "--out-background-fits",
+        default=None,
+        help=(
+            "Optional standalone FITS file containing the fitted background model "
+            "in nMgy/pix. This is equivalent to the BKG_NMGY extension and can "
+            "be passed to gadget_movie.py with --background-file."
+        ),
+    )
+
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
 
@@ -637,6 +649,23 @@ def main():
         )
 
     fits.HDUList(hdus).writeto(args.output_fits, overwrite=args.overwrite)
+
+    if args.out_background_fits is not None:
+        bkg_hdr = add_common(hdr, "nMgy/pix")
+        bkg_hdr["IMTYPE"] = ("BKG_NMGY", "Fitted background model")
+        bkg_hdr["SRCFILE"] = (os.path.basename(args.input_fits), "Input Legacy image")
+        bkg_hdr["SRCEXT"] = ("BKG_NMGY", "Equivalent extension in output MEF")
+        for k, v in bkg_meta.items():
+            try:
+                bkg_hdr[k] = v
+            except Exception:
+                pass
+        fits.PrimaryHDU(
+            data=bkg_map_nmgy.astype(np.float32),
+            header=bkg_hdr,
+        ).writeto(args.out_background_fits, overwrite=args.overwrite)
+        print("Wrote background model:", args.out_background_fits)
+
     print("Wrote:", args.output_fits)
     print("HDU names:", [h.name for h in hdus])
 

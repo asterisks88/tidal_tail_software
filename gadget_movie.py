@@ -430,13 +430,24 @@ def _counts_from_masses(
     return counts
 
 
-def read_fits_2d(path: Path, hdu: int = 1):
+def read_fits_2d(path: Path, hdu: int | str = 1):
     """
     Read a 2D FITS image and return (data, header).
+
+    The HDU can be an integer index, a numeric string, or an EXTNAME such as
+    BKG_NMGY from the mu_from_legacy.py output MEF.
     """
+    hdu_key = hdu
+    if isinstance(hdu_key, str):
+        hdu_key = hdu_key.strip()
+        try:
+            hdu_key = int(hdu_key)
+        except ValueError:
+            pass
+
     with fits.open(path, memmap=True) as hdul:
-        data = np.asarray(hdul[hdu].data, dtype=np.float64)
-        hdr = hdul[hdu].header.copy()
+        data = np.asarray(hdul[hdu_key].data, dtype=np.float64)
+        hdr = hdul[hdu_key].header.copy()
 
     if data.ndim != 2:
         raise RuntimeError(f"{path} HDU {hdu} is not 2D; got shape {data.shape}")
@@ -453,6 +464,70 @@ def _sigma_from_invvar(invvar):
     good = np.isfinite(invvar) & (invvar > 0)
     sigma[good] = 1.0 / np.sqrt(invvar[good])
     return sigma
+
+
+def _build_master_map_from_brick_image(
+    brick_map,
+    *,
+    master_x0_edge,
+    master_y0_edge,
+    master_w,
+    master_h,
+    brick_size,
+    brick_host_xy,
+    fill_value=None,
+    map_name="brick map",
+):
+    """
+    Place a brick-grid image onto the common master grid.
+
+    The master grid is phase-aligned with the Legacy brick grid, so the placement
+    is an integer copy. Pixels outside the brick footprint are filled with the
+    median finite brick value unless fill_value is provided.
+    """
+    brick_w, brick_h = map(int, brick_size)
+
+    brick_map = np.asarray(brick_map, dtype=np.float64)
+    if brick_map.shape != (brick_h, brick_w):
+        raise RuntimeError(
+            f"{map_name} shape {brick_map.shape} does not match "
+            f"brick image shape {(brick_h, brick_w)}"
+        )
+
+    valid = np.isfinite(brick_map)
+    if fill_value is None:
+        fill = float(np.nanmedian(brick_map[valid])) if np.any(valid) else 0.0
+    else:
+        fill = float(fill_value)
+
+    master_map = np.full((master_h, master_w), fill, dtype=np.float64)
+
+    # Location of brick pixel (0,0) within the master array.
+    x0_float = -float(brick_host_xy[0]) - (float(master_x0_edge) + 0.5)
+    y0_float = -float(brick_host_xy[1]) - (float(master_y0_edge) + 0.5)
+
+    x0 = int(round(x0_float))
+    y0 = int(round(y0_float))
+
+    if abs(x0_float - x0) > 1e-6 or abs(y0_float - y0) > 1e-6:
+        raise RuntimeError(
+            "Master grid is not phase-aligned with the brick grid as expected: "
+            f"x0_float={x0_float}, y0_float={y0_float}"
+        )
+
+    x1 = x0 + brick_w
+    y1 = y0 + brick_h
+
+    if x0 < 0 or y0 < 0 or x1 > master_w or y1 > master_h:
+        raise RuntimeError(
+            f"{map_name} placement falls outside master image: "
+            f"x=[{x0},{x1}) of {master_w}, y=[{y0},{y1}) of {master_h}"
+        )
+
+    brick_filled = brick_map.copy()
+    brick_filled[~valid] = fill
+    master_map[y0:y1, x0:x1] = brick_filled
+    return master_map, fill
 
 
 def _build_master_sigma_from_brick_sigma(
@@ -990,6 +1065,9 @@ def _build_common_master_image(
     render_host=True,
     render_sat=True,
     brick_sigma_map=None,
+    brick_background_map=None,
+    background_scale=1.0,
+    background_offset=0.0,
     rng=None,
 ):
     """
@@ -998,7 +1076,9 @@ def _build_common_master_image(
     The master image is large enough to support BOTH the brick output and the
     host-centered output, with PSF padding, from a single render/convolution.
 
-    Noise handling:
+    Background and noise handling:
+      - if brick_background_map is provided, add that deterministic large-scale
+        background/sky-offset image after PSF convolution and before random noise
       - if brick_sigma_map is provided, use that spatially varying sigma map
         (derived from invvar) and ignore noise_std
       - otherwise use scalar noise_std
@@ -1109,10 +1189,33 @@ def _build_common_master_image(
             normalize_kernel=True,
         )
 
+    background_mode = "NONE"
+    background_fill_value = None
+
+    # Add deterministic large-scale background/sky offset AFTER PSF convolution
+    # and BEFORE random noise.  This is useful for matching the real Legacy
+    # brick distribution when the sky-subtracted pixels are not centered on zero.
+    if brick_background_map is not None:
+        master_background, background_fill_value = _build_master_map_from_brick_image(
+            brick_background_map,
+            master_x0_edge=master_x0_edge,
+            master_y0_edge=master_y0_edge,
+            master_w=master_w,
+            master_h=master_h,
+            brick_size=brick_size,
+            brick_host_xy=brick_host_xy,
+            fill_value=None,
+            map_name="brick background map",
+        )
+        master_img = master_img + float(background_scale) * master_background + float(
+            background_offset
+        )
+        background_mode = "BRICK"
+
     noise_mode = "NONE"
     noise_fill_sigma = None
 
-    # Add noise AFTER PSF convolution
+    # Add noise AFTER PSF convolution and deterministic background addition
     if brick_sigma_map is not None:
         master_sigma, noise_fill_sigma = _build_master_sigma_from_brick_sigma(
             brick_sigma_map,
@@ -1147,6 +1250,10 @@ def _build_common_master_image(
         "pad": int(pad),
         "x_rel": x_rel,
         "y_rel": y_rel,
+        "background_mode": background_mode,
+        "background_fill_value": background_fill_value,
+        "background_scale": float(background_scale),
+        "background_offset": float(background_offset),
         "noise_mode": noise_mode,
         "noise_fill_sigma": noise_fill_sigma,
     }
@@ -1215,6 +1322,9 @@ def _render_shared_outputs(
     render_host=True,
     render_sat=True,
     brick_sigma_map=None,
+    brick_background_map=None,
+    background_scale=1.0,
+    background_offset=0.0,
     rng=None,
 ):
     """
@@ -1242,6 +1352,9 @@ def _render_shared_outputs(
         render_host=render_host,
         render_sat=render_sat,
         brick_sigma_map=brick_sigma_map,
+        brick_background_map=brick_background_map,
+        background_scale=background_scale,
+        background_offset=background_offset,
         rng=rng,
     )
     brick_img = _extract_from_master(
@@ -1376,6 +1489,9 @@ def gadget_hdf5_movie(
     brick_shape=None,
     brick_pixscale=None,
     brick_invvar=None,
+    brick_background_map=None,
+    background_scale=1.0,
+    background_offset=0.0,
     noise_seed=None,
     noise_batch_count=100,
     fps=None,
@@ -1466,6 +1582,29 @@ def gadget_hdf5_movie(
             "[Noise] Using global scalar noise sigma. "
             f"sigma = {float(noise_std) if noise_std is not None else 0.0:.6e} nmgy/pix"
         )
+
+    if brick_background_map is not None:
+        brick_background_map = np.asarray(brick_background_map, dtype=np.float64)
+        if brick_background_map.shape != (height_b, width_b):
+            raise RuntimeError(
+                f"brick_background_map shape {brick_background_map.shape} does not match "
+                f"brick image shape {(height_b, width_b)}"
+            )
+        finite_bkg = np.isfinite(brick_background_map)
+        if np.any(finite_bkg):
+            print(
+                "[Background] Adding brick background map. "
+                f"median={np.nanmedian(brick_background_map[finite_bkg]):.6e} "
+                f"nmgy/pix, scale={float(background_scale):.6g}, "
+                f"offset={float(background_offset):.6e} nmgy/pix"
+            )
+        else:
+            print(
+                "[Background] Background map has no finite pixels; using zero fill.",
+                file=sys.stderr,
+            )
+    else:
+        print("[Background] No deterministic background map will be added.")
 
     # Brick target pixels (0-based)
     host_xb, host_yb = brick_wcs.all_world2pix(host_ra, host_dec, 0)
@@ -1859,6 +1998,9 @@ def gadget_hdf5_movie(
                 render_host=True,
                 render_sat=True,
                 brick_sigma_map=brick_sigma_map,
+                brick_background_map=brick_background_map,
+                background_scale=background_scale,
+                background_offset=background_offset,
                 rng=rng,
             )
         )
@@ -1934,6 +2076,24 @@ def gadget_hdf5_movie(
             hdr["NFILLSIG"] = (
                 float(render_meta["noise_fill_sigma"]),
                 "Sigma used outside brick footprint (nmgy/pix)",
+            )
+
+        hdr["BKGADD"] = (
+            render_meta.get("background_mode") == "BRICK",
+            "Deterministic brick background was added",
+        )
+        hdr["BKGSCAL"] = (
+            float(render_meta.get("background_scale", 1.0)),
+            "Scale factor applied to background map",
+        )
+        hdr["BKGOFF"] = (
+            float(render_meta.get("background_offset", 0.0)),
+            "Constant background offset added (nmgy/pix)",
+        )
+        if render_meta.get("background_fill_value") is not None:
+            hdr["BKGFILL"] = (
+                float(render_meta["background_fill_value"]),
+                "Background fill outside brick footprint (nmgy/pix)",
             )
 
         if bool(mag_out):
@@ -2294,6 +2454,9 @@ def gadget_hdf5_movie(
                     render_host=(not satellite_only),
                     render_sat=True,
                     brick_sigma_map=brick_sigma_map,
+                    brick_background_map=brick_background_map,
+                    background_scale=background_scale,
+                    background_offset=background_offset,
                     rng=rng,
                 )
             )
@@ -2397,6 +2560,23 @@ def gadget_hdf5_movie(
             "SATONLY" if satellite_only else "BOTH",
             "Rendered components",
         )
+        hdr["BKGADD"] = (
+            render_meta.get("background_mode") == "BRICK",
+            "Deterministic brick background was added",
+        )
+        hdr["BKGSCAL"] = (
+            float(render_meta.get("background_scale", 1.0)),
+            "Scale factor applied to background map",
+        )
+        hdr["BKGOFF"] = (
+            float(render_meta.get("background_offset", 0.0)),
+            "Constant background offset added (nmgy/pix)",
+        )
+        if render_meta.get("background_fill_value") is not None:
+            hdr["BKGFILL"] = (
+                float(render_meta["background_fill_value"]),
+                "Background fill outside brick footprint (nmgy/pix)",
+            )
 
         if bool(mag_out):
             hdr["COMMENT"] = (
@@ -2640,6 +2820,37 @@ def main():
         help="HDU for --invvar-file (default 1)",
     )
     parser.add_argument(
+        "--background-file",
+        type=Path,
+        default=None,
+        help=(
+            "Optional FITS image containing a deterministic background/sky-offset "
+            "model in nMgy/pix to add to the synthetic image before random noise. "
+            "You can pass the mu_from_legacy.py output MEF here and use "
+            "--background-hdu BKG_NMGY."
+        ),
+    )
+    parser.add_argument(
+        "--background-hdu",
+        default="BKG_NMGY",
+        help=(
+            "HDU index or EXTNAME for --background-file. Default: BKG_NMGY. "
+            "Use 0 for a standalone background FITS."
+        ),
+    )
+    parser.add_argument(
+        "--background-scale",
+        type=float,
+        default=1.0,
+        help="Multiplicative scale applied to the background map before adding it.",
+    )
+    parser.add_argument(
+        "--background-offset",
+        type=float,
+        default=0.0,
+        help="Constant nMgy/pix offset added after the scaled background map.",
+    )
+    parser.add_argument(
         "--noise",
         type=float,
         default=0.01,
@@ -2749,6 +2960,20 @@ def main():
                 f"--invvar-file shape {brick_invvar.shape} does not match "
                 f"--brick-file shape {(ny_b, nx_b)}"
             )
+
+    brick_background_map = None
+    if args.background_file is not None:
+        brick_background_map, background_hdr = read_fits_2d(
+            args.background_file, hdu=args.background_hdu
+        )
+
+        ny_b, nx_b = brick_shape
+        if brick_background_map.shape != (ny_b, nx_b):
+            raise RuntimeError(
+                f"--background-file shape {brick_background_map.shape} does not match "
+                f"--brick-file shape {(ny_b, nx_b)}"
+            )
+
     start_frame = args.start_frame
     end_frame = args.end_frame
     show_window = True if args.mp4 is None else args.show
@@ -2774,6 +2999,9 @@ def main():
         brick_shape=brick_shape,
         brick_pixscale=brick_pixscale,
         brick_invvar=brick_invvar,
+        brick_background_map=brick_background_map,
+        background_scale=args.background_scale,
+        background_offset=args.background_offset,
         noise_seed=args.noise_seed,
         noise_batch_count=args.noise_batch_count,
         fps=args.fps,
