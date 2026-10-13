@@ -325,53 +325,97 @@ def _decode_header_str_array(arr) -> list[str]:
 
 def _get_galaxy_id_ranges(h5f, galaxyid_map_path=None):
     """
-    Uses your header attrs:
-      GalaxyID_Name, GalaxyID_Infile, GalaxyID_IDOffset, GalaxyID_IDMin/Max, GalaxyID_IDStart/End
+    Read galaxy ParticleID ranges from either the snapshot Header or a JSON
+    sidecar map.
 
-    Returns:
-      starts_s, ends_s, names_s, order_s
-    where arrays are sorted by starts (increasing).
+    Returns
+    -------
+    starts_s : ndarray
+        Inclusive starting ParticleID for each galaxy, sorted by ID start.
+    ends_s : ndarray
+        Inclusive ending ParticleID for each galaxy, in the same order.
+    names_s : list[str]
+        Galaxy names in the same sorted order.
+    order : ndarray
+        Indices mapping the original metadata order into sorted order.
     """
+    if "Header" not in h5f:
+        raise RuntimeError("Snapshot does not contain an HDF5 Header group.")
+
     hdr = h5f["Header"].attrs
+
     if "GalaxyID_IDStart" in hdr and "GalaxyID_IDEnd" in hdr:
+        # The combined frame-0 IC normally follows this branch.
         starts = np.asarray(hdr["GalaxyID_IDStart"], dtype=np.int64)
         ends = np.asarray(hdr["GalaxyID_IDEnd"], dtype=np.int64)
         names = _decode_header_str_array(hdr.get("GalaxyID_Name", []))
-        return starts, ends, names
+        source = "snapshot Header"
+
     else:
+        # Gadget output snapshots may require the persistent JSON sidecar.
         if galaxyid_map_path is None:
             raise RuntimeError(
-                "Snapshot missing GalaxyID_* header attrs and no --galaxyid-map provided."
+                "Snapshot is missing GalaxyID_* header attributes and no "
+                "--galaxyid-map was provided."
             )
 
-        d = json.loads(Path(galaxyid_map_path).read_text())
-        starts = np.asarray(d["GalaxyID_IDStart"], dtype=np.int64)
-        ends = np.asarray(d["GalaxyID_IDEnd"], dtype=np.int64)
-        names = list(d.get("GalaxyID_Name", []))
+        map_path = Path(galaxyid_map_path).expanduser()
 
-        # Optional but useful for debugging / sanity checks
-        names = _decode_header_str_array(hdr.get("GalaxyID_Name", None))
+        if not map_path.is_file():
+            raise RuntimeError(f"GalaxyID sidecar map does not exist: {map_path}")
 
-    if starts.ndim != 1 or ends.ndim != 1 or starts.size != ends.size:
+        with map_path.open("r") as fp:
+            mapping = json.load(fp)
+
+        try:
+            starts = np.asarray(mapping["GalaxyID_IDStart"], dtype=np.int64)
+            ends = np.asarray(mapping["GalaxyID_IDEnd"], dtype=np.int64)
+        except KeyError as exc:
+            raise RuntimeError(
+                f"{map_path} is missing required key {exc.args[0]!r}"
+            ) from exc
+
+        # Do not overwrite sidecar names with absent snapshot-header names.
+        names = _decode_header_str_array(mapping.get("GalaxyID_Name", []))
+        source = str(map_path)
+
+    if starts.ndim != 1 or ends.ndim != 1:
         raise RuntimeError(
-            "GalaxyID_IDStart/End malformed (expected 1D arrays of same length)."
+            "GalaxyID_IDStart and GalaxyID_IDEnd must be one-dimensional."
         )
 
-    n = starts.size
-    if n < 2:
+    if starts.size != ends.size:
         raise RuntimeError(
-            "Need at least 2 galaxies in GalaxyID_* arrays (host + sat)."
+            "GalaxyID_IDStart and GalaxyID_IDEnd have different lengths: "
+            f"{starts.size} and {ends.size}."
         )
 
-    # Sort by start to make searchsorted mapping robust
-    order = np.argsort(starts)
+    if starts.size < 2:
+        raise RuntimeError("Need at least two galaxies in the GalaxyID ranges.")
+
+    if np.any(ends < starts):
+        raise RuntimeError(
+            "Found a GalaxyID range whose ending ID precedes its starting ID."
+        )
+
+    # Sort ranges by starting ParticleID so searchsorted mapping is reliable.
+    order = np.argsort(starts, kind="stable")
     starts_s = starts[order]
     ends_s = ends[order]
-    names_s = [names[i] if i < len(names) else f"gal{i}" for i in order]
 
-    # Basic sanity: non-overlap / monotonic ends not strictly required, but helps
-    if np.any(ends_s < starts_s):
-        raise RuntimeError("Found GalaxyID range where IDEnd < IDStart.")
+    names_s = [names[index] if index < len(names) else f"gal{index}" for index in order]
+
+    # Ranges are inclusive, so the next start must be greater than the
+    # preceding end.
+    if starts_s.size > 1 and np.any(starts_s[1:] <= ends_s[:-1]):
+        raise RuntimeError("GalaxyID ParticleID ranges overlap after sorting.")
+
+    print(f"Loaded GalaxyID ranges from {source}:")
+    for index, (name, start, end) in enumerate(zip(names_s, starts_s, ends_s)):
+        print(
+            f"  sorted GalaxyID {index}: {name}: "
+            f"ParticleIDs {int(start)}--{int(end)}"
+        )
 
     return starts_s, ends_s, names_s, order
 
@@ -1207,8 +1251,10 @@ def _build_common_master_image(
             fill_value=None,
             map_name="brick background map",
         )
-        master_img = master_img + float(background_scale) * master_background + float(
-            background_offset
+        master_img = (
+            master_img
+            + float(background_scale) * master_background
+            + float(background_offset)
         )
         background_mode = "BRICK"
 
@@ -1256,6 +1302,13 @@ def _build_common_master_image(
         "background_offset": float(background_offset),
         "noise_mode": noise_mode,
         "noise_fill_sigma": noise_fill_sigma,
+        "render_host": bool(render_host),
+        "render_sat": bool(render_sat),
+        "render_component": (
+            "BOTH"
+            if render_host and render_sat
+            else ("HOSTONLY" if render_host else "SATONLY")
+        ),
     }
     return master_img, meta
 
@@ -1501,9 +1554,32 @@ def gadget_hdf5_movie(
     camera_save=None,
     tail_bbox=None,
     debug_photometry=False,
+    synthetic_component="both",
 ):
     global paused, running, update_frame, current_frame, start_frame, end_frame, frame_step
     frame_step = max(1, int(step_size))
+
+    synthetic_component = str(synthetic_component).strip().lower()
+    if synthetic_component not in {"both", "host", "satellite"}:
+        raise ValueError("synthetic_component must be one of: both, host, satellite")
+
+    selected_render_host = synthetic_component in {"both", "host"}
+    selected_render_sat = synthetic_component in {"both", "satellite"}
+    component_header_value = {
+        "both": "BOTH",
+        "host": "HOSTONLY",
+        "satellite": "SATONLY",
+    }[synthetic_component]
+    component_description = {
+        "both": "host+satellite",
+        "host": "host-only",
+        "satellite": "satellite-only",
+    }[synthetic_component]
+
+    print(
+        f"[SyntheticRender] Saved synthetic images will contain "
+        f"{component_description} luminous particle signal."
+    )
 
     recording = mp4_path is not None
     if recording and keep_looping:
@@ -1779,7 +1855,7 @@ def gadget_hdf5_movie(
 
     def update_scale_bar(force=False):
         """
-        Draw/update a 50 kpc scale bar as a 2D overlay in the lower-right corner.
+        Draw/update a 50 kpc scale bar as a 2D overlay in the upper-left corner.
         The bar length changes with zoom, but its anchor position is stable.
         """
         nonlocal scale_bar_poly
@@ -1818,29 +1894,55 @@ def gadget_hdf5_movie(
         px_per_kpc = float(win_w) / (2.0 * float(half_w))
         bar_len_px = SCALE_BAR_KPC * px_per_kpc
 
-        # Stable lower-right anchoring in display pixels.
-        margin_right = 70.0
-        margin_bottom = 55.0
+        # Stable upper-left anchoring in display pixels.
+        margin_left = 70.0
+        margin_top = 55.0
         tick_half_len = 10.0
-        label_offset = 4.0  # closer to the bar vertically
+        label_offset = 4.0
 
-        x1 = float(win_w) - margin_right
-        x0 = x1 - bar_len_px
-        y0 = margin_bottom
+        x0 = margin_left
+        x1 = x0 + bar_len_px
+        y0 = float(win_h) - margin_top
 
-        # If the bar becomes wider than the window, clamp it.
-        if x0 < 20.0:
-            x0 = 20.0
-            x1 = x0 + bar_len_px
+        # If the bar becomes wider than the available window, clamp its
+        # right endpoint while preserving the upper-left anchor.
+        if x1 > float(win_w) - 20.0:
+            x1 = float(win_w) - 20.0
+
+        displayed_bar_len_px = x1 - x0
 
         geom = (
             round(x0, 2),
             round(x1, 2),
             round(y0, 2),
-            round(bar_len_px, 2),
+            round(displayed_bar_len_px, 2),
             int(win_w),
             int(win_h),
         )
+
+        # Stable lower-right anchoring in display pixels.
+        # margin_right = 70.0
+        # margin_bottom = 55.0
+        # tick_half_len = 10.0
+        # label_offset = 4.0  # closer to the bar vertically
+
+        # x1 = float(win_w) - margin_right
+        # x0 = x1 - bar_len_px
+        # y0 = margin_bottom
+
+        # If the bar becomes wider than the window, clamp it.
+        # if x0 < 20.0:
+        #    x0 = 20.0
+        #    x1 = x0 + bar_len_px
+
+        # geom = (
+        #    round(x0, 2),
+        #    round(x1, 2),
+        #    round(y0, 2),
+        #    round(bar_len_px, 2),
+        #    int(win_w),
+        #    int(win_h),
+        # )
         if (not force) and (_scale_bar_last == geom):
             return
         _scale_bar_last = geom
@@ -1992,11 +2094,11 @@ def gadget_hdf5_movie(
                 host_size=(host_w, host_h),
                 host_center_xy=host_center_xy,
                 masses=masses,
-                tail_bbox=tail_bbox,
+                tail_bbox=(tail_bbox if selected_render_sat else None),
                 m_sat_total_overall=m_sat_total,
                 m_host_total_overall=m_host_total,
-                render_host=True,
-                render_sat=True,
+                render_host=selected_render_host,
+                render_sat=selected_render_sat,
                 brick_sigma_map=brick_sigma_map,
                 brick_background_map=brick_background_map,
                 background_scale=background_scale,
@@ -2050,6 +2152,10 @@ def gadget_hdf5_movie(
             str(gal_names[sat_gid]),
             "GalaxyID_Name for satellite (from snapshot)",
         )
+        hdr["RENDER"] = (
+            str(render_meta.get("render_component", component_header_value)),
+            "Rendered luminous particle components",
+        )
 
         hdr["NOISEMOD"] = (
             str(render_meta.get("noise_mode", "UNKNOWN")),
@@ -2096,11 +2202,21 @@ def gadget_hdf5_movie(
                 "Background fill outside brick footprint (nmgy/pix)",
             )
 
+        render_text = {
+            "BOTH": "host and satellite",
+            "HOSTONLY": "host only",
+            "SATONLY": "satellite only",
+        }.get(str(hdr["RENDER"]).strip().upper(), component_description)
+
         if bool(mag_out):
-            hdr["COMMENT"] = "Synthetic image in mag/arcsec^2 aligned to brick WCS."
+            hdr["COMMENT"] = (
+                "Synthetic image in mag/arcsec^2 aligned to brick WCS; "
+                f"luminous particle signal: {render_text}."
+            )
         else:
             hdr["COMMENT"] = (
-                "Synthetic image in nanomaggies/pixel aligned to brick WCS."
+                "Synthetic image in nanomaggies/pixel aligned to brick WCS; "
+                f"luminous particle signal: {render_text}."
             )
 
         return hdr
@@ -2217,7 +2333,12 @@ def gadget_hdf5_movie(
             root = tk.Tk()
             root.withdraw()
             fn = filedialog.asksaveasfilename(
-                title="Save simulated FITS (aligned to brick)",
+                title=(
+                    "Save simulated FITS aligned to brick " f"({component_description})"
+                ),
+                initialfile=(
+                    f"synthetic_frame_{current_frame:06d}_{synthetic_component}.fits"
+                ),
                 defaultextension=".fits",
                 filetypes=[("FITS files", "*.fits"), ("All files", "*.*")],
             )
@@ -2225,7 +2346,10 @@ def gadget_hdf5_movie(
             if fn:
                 filename = fn
         except Exception:
-            filename = input("Enter output FITS filename (e.g., image.fits): ").strip()
+            filename = input(
+                "Enter output FITS filename "
+                f"[{component_description}; e.g. image.fits]: "
+            ).strip()
 
         if not filename:
             print("Save cancelled.", file=sys.stderr)
@@ -2241,7 +2365,10 @@ def gadget_hdf5_movie(
         hdu = fits.PrimaryHDU(np.asarray(img, dtype=np.float32), header=hdr)
         try:
             hdu.writeto(filename, overwrite=True)
-            print(f"Saved aligned synthetic FITS to: {filename}")
+            print(
+                f"Saved aligned {component_description} synthetic FITS to: "
+                f"{filename}"
+            )
         except Exception as e:
             print(f"[Error] Failed to write FITS file: {e}", file=sys.stderr)
 
@@ -2269,7 +2396,10 @@ def gadget_hdf5_movie(
             root = tk.Tk()
             root.withdraw()
             folder = filedialog.askdirectory(
-                title=f"Choose folder for {batch_count} simulated brick images"
+                title=(
+                    f"Choose folder for {batch_count} simulated brick images "
+                    f"({component_description})"
+                )
             )
             root.destroy()
             if folder:
@@ -2286,8 +2416,8 @@ def gadget_hdf5_movie(
         out_dir.mkdir(parents=True, exist_ok=True)
 
         print(
-            f"[BatchSave] Saving {batch_count} simulated brick images for frame "
-            f"{current_frame} into {out_dir}"
+            f"[BatchSave] Saving {batch_count} {component_description} "
+            f"simulated brick images for frame {current_frame} into {out_dir}"
         )
 
         for i in range(1, batch_count + 1):
@@ -2384,8 +2514,29 @@ def gadget_hdf5_movie(
     host_w, host_h = map(int, host_image_size)
     host_center_xy = ((host_w - 1) / 2.0, (host_h - 1) / 2.0)
 
-    def save_host_centered_surface_brightness(satellite_only=False):
+    def save_host_centered_surface_brightness(component_override=None):
         global current_frame
+
+        render_component = (
+            synthetic_component
+            if component_override is None
+            else str(component_override).strip().lower()
+        )
+        if render_component not in {"both", "host", "satellite"}:
+            raise ValueError("render component must be one of: both, host, satellite")
+
+        render_host_now = render_component in {"both", "host"}
+        render_sat_now = render_component in {"both", "satellite"}
+        render_header_now = {
+            "both": "BOTH",
+            "host": "HOSTONLY",
+            "satellite": "SATONLY",
+        }[render_component]
+        render_description_now = {
+            "both": "host+satellite",
+            "host": "host-only",
+            "satellite": "satellite-only",
+        }[render_component]
         try:
             coords, counts, gid, masses, m_host_total, m_sat_total = (
                 _load_luminous_frame(current_frame)
@@ -2451,8 +2602,8 @@ def gadget_hdf5_movie(
                     brick_host_xy=host_target_xy,
                     host_size=(host_w, host_h),
                     host_center_xy=host_center_xy,
-                    render_host=(not satellite_only),
-                    render_sat=True,
+                    render_host=render_host_now,
+                    render_sat=render_sat_now,
                     brick_sigma_map=brick_sigma_map,
                     brick_background_map=brick_background_map,
                     background_scale=background_scale,
@@ -2489,9 +2640,11 @@ def gadget_hdf5_movie(
             root.withdraw()
             fn = filedialog.asksaveasfilename(
                 title=(
-                    "Save simulated FITS (host-centered, satellite-only)"
-                    if satellite_only
-                    else "Save simulated FITS (host-centered)"
+                    "Save simulated FITS host-centered " f"({render_description_now})"
+                ),
+                initialfile=(
+                    f"synthetic_host_centered_frame_{current_frame:06d}_"
+                    f"{render_component}.fits"
                 ),
                 defaultextension=".fits",
                 filetypes=[("FITS files", "*.fits"), ("All files", "*.*")],
@@ -2502,7 +2655,7 @@ def gadget_hdf5_movie(
         except Exception:
             filename = input(
                 "Enter output FITS filename "
-                f"({'sat_only' if satellite_only else 'host_centered'}.fits): "
+                f"[{render_description_now}; host_centered.fits]: "
             ).strip()
 
         if not filename:
@@ -2557,8 +2710,8 @@ def gadget_hdf5_movie(
         hdr["IMAGEW"] = (int(host_w), "Image width (pixels)")
         hdr["IMAGEH"] = (int(host_h), "Image height (pixels)")
         hdr["RENDER"] = (
-            "SATONLY" if satellite_only else "BOTH",
-            "Rendered components",
+            render_header_now,
+            "Rendered luminous particle components",
         )
         hdr["BKGADD"] = (
             render_meta.get("background_mode") == "BRICK",
@@ -2580,36 +2733,33 @@ def gadget_hdf5_movie(
 
         if bool(mag_out):
             hdr["COMMENT"] = (
-                "Synthetic image in mag/arcsec^2, host-centered WCS, satellite-only."
-                if satellite_only
-                else "Synthetic image in mag/arcsec^2, host-centered WCS."
+                "Synthetic image in mag/arcsec^2, host-centered WCS; "
+                f"luminous particle signal: {render_description_now}."
             )
         else:
             hdr["COMMENT"] = (
-                "Synthetic image in nanomaggies/pixel, host-centered WCS, satellite-only."
-                if satellite_only
-                else "Synthetic image in nanomaggies/pixel, host-centered WCS."
+                "Synthetic image in nanomaggies/pixel, host-centered WCS; "
+                f"luminous particle signal: {render_description_now}."
             )
 
         hdu = fits.PrimaryHDU(np.asarray(img, dtype=np.float32), header=hdr)
         try:
             hdu.writeto(filename, overwrite=True)
             print(
-                (
-                    "Saved host-centered satellite-only FITS to:"
-                    if satellite_only
-                    else "Saved host-centered FITS to:"
-                ),
-                filename,
+                f"Saved host-centered {render_description_now} FITS to: " f"{filename}"
             )
         except Exception as e:
             print(f"[Erro] Failed to write FITS file: {e}", file=sys.stderr)
 
+    # h obeys the command-line component selection.  The explicit x/z
+    # shortcuts are retained for convenient host-only/satellite-only diagnostics.
+    p.add_key_event("h", save_host_centered_surface_brightness)
     p.add_key_event(
-        "h", lambda: save_host_centered_surface_brightness(satellite_only=False)
+        "x", lambda: save_host_centered_surface_brightness(component_override="host")
     )
     p.add_key_event(
-        "z", lambda: save_host_centered_surface_brightness(satellite_only=True)
+        "z",
+        lambda: save_host_centered_surface_brightness(component_override="satellite"),
     )
 
     # Initialize render window
@@ -2721,7 +2871,11 @@ def main():
     global start_frame, end_frame
 
     parser = argparse.ArgumentParser(
-        description="Visualize Gadget-4 HDF5 snapshots with PyVista; press 's' to save aligned synthetic image."
+        description=(
+            "Visualize Gadget-4 HDF5 snapshots with PyVista; press 's' to save "
+            "an aligned synthetic image. Use --host-only or --satellite-only "
+            "to select the luminous particle origin included in saved images."
+        )
     )
     parser.add_argument(
         "pattern", type=str, help="Filename pattern, e.g., output_{:06d}.hdf5"
@@ -2885,6 +3039,39 @@ def main():
         action="store_true",
         help="Output mag/arcsec^2 (otherwise nanomaggies/pixel)",
     )
+
+    component_group = parser.add_mutually_exclusive_group()
+    component_group.add_argument(
+        "--host-only",
+        dest="synthetic_component",
+        action="store_const",
+        const="host",
+        help=(
+            "Save only luminous particles that originated in the host galaxy. "
+            "Configured PSF, background, and noise are still applied."
+        ),
+    )
+    component_group.add_argument(
+        "--satellite-only",
+        dest="synthetic_component",
+        action="store_const",
+        const="satellite",
+        help=(
+            "Save only luminous particles that originated in the satellite galaxy. "
+            "Configured PSF, background, and noise are still applied."
+        ),
+    )
+    component_group.add_argument(
+        "--both-galaxies",
+        dest="synthetic_component",
+        action="store_const",
+        const="both",
+        help=(
+            "Save host and satellite luminous particles together. This is the default."
+        ),
+    )
+    parser.set_defaults(synthetic_component="both")
+
     parser.add_argument(
         "--tail-bbox",
         type=float,
@@ -3011,6 +3198,7 @@ def main():
         camera_save=args.camera_save,
         tail_bbox=tail_bbox,
         debug_photometry=bool(args.debug_photometry),
+        synthetic_component=args.synthetic_component,
     )
 
 
