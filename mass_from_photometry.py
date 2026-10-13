@@ -3,6 +3,10 @@
 """
 Elliptical/S0 luminous mass & M200 from SDSS/DES g,r & z (Astropy)
 
+Usage: mass_from_photometry.py galaxy.json galaxy_profile.magnitudes.json [options]
+The galaxy file supplies redshift and structural data; the second file is the
+combined g/r Sérsic-total magnitude JSON from legacy_ellipse_profile.py.
+
 Formatting rules:
 - Msun/Lsun fields: scientific notation strings with 3 significant figures.
 - Magnitudes & colors: 5 significant figures, fixed notation.
@@ -61,8 +65,8 @@ def sig3_noexp_str(x: Any) -> str:
 
 
 def mag5_noexp_str(x: Any) -> str:
-    """Magnitudes/colors: 5 significant figures, fixed notation."""
-    return sig_noexp_str(x, 5)
+    """Magnitudes/colors: 6 significant figures, fixed notation."""
+    return sig_noexp_str(x, 6)
 
 
 def key_is_msun_or_lsun(key: Optional[str]) -> bool:
@@ -78,12 +82,17 @@ _MAG_KEYS_EXPLICIT = {
     "u",
     "i",
     "z",
+    "M_r",
     "M_r_mag",
+    "M_r_input_mag",
+    "M_r_photometric_mag",
     "M_g_mag",
     "M_i_mag",
     "M_z_mag",
     "M_u_mag",
     "M_r_sun_mag",
+    "g0",
+    "r0",
     "(g-r)_0",
     "g_minus_r_0",
     "g_minus_r_obs",
@@ -225,10 +234,21 @@ def default_ml_systematic_dex(ml_mode: str) -> float:
     return 0.10
 
 
-def compute_restframe_quantities(g, r, z, ml_mode: str, M_r_sun: float, cosmo):
+def compute_restframe_quantities(
+    g,
+    r,
+    z,
+    ml_mode: str,
+    M_r_sun: float,
+    cosmo,
+):
     """
     Vectorized helper:
-      g,r,z -> K_g,K_r,(g-r)_0,M_r,L_r,M/L_r,M_star
+      g,r,z -> K_g,K_r -> (g-r)_0
+      M_r -> L_r -> M/L_r -> M_star
+
+    If M_r_input is supplied, it is used directly for the luminosity.
+    Otherwise M_r is computed from r, K_r, and the distance modulus.
     """
     g = np.asarray(g, dtype=float)
     r = np.asarray(r, dtype=float)
@@ -241,9 +261,9 @@ def compute_restframe_quantities(g, r, z, ml_mode: str, M_r_sun: float, cosmo):
     g0 = g - Kg
     r0 = r - Kr
     gmr0 = g0 - r0
-
     mu = cosmo.distmod(z).value
     M_r = r0 - mu
+
     Lr_Lsun = 10.0 ** (-0.4 * (M_r - M_r_sun))
 
     if ml_mode == "zcr09":
@@ -301,8 +321,6 @@ def estimate_photometric_uncertainties_mc(
     ml_mode: str,
     M_r_sun: float,
     cosmo,
-    mstar_missing: float,
-    mhalo_missing: float,
     g_err: Optional[float] = None,
     r_err: Optional[float] = None,
     z_err: Optional[float] = None,
@@ -331,19 +349,23 @@ def estimate_photometric_uncertainties_mc(
 
     # Avoid z <= 0 causing pathological distance moduli
     zs = np.clip(zs, 1.0e-8, None)
-
-    base = compute_restframe_quantities(gs, rs, zs, ml_mode, M_r_sun, cosmo)
+    base = compute_restframe_quantities(
+        gs,
+        rs,
+        zs,
+        ml_mode,
+        M_r_sun,
+        cosmo,
+    )
 
     phot = {
         "g_minus_r_0": summarize_samples(base["gmr0"], positive_only=False),
         "M_r_mag": summarize_samples(base["M_r"], positive_only=False),
         "L_r_Lsun": summarize_samples(base["Lr_Lsun"], positive_only=True),
         "M_over_L_r": summarize_samples(base["ML"], positive_only=True),
-        "M_star_Msun": summarize_samples(
-            base["Mstar"] * mhalo_missing, positive_only=True
-        ),
+        "M_star_Msun": summarize_samples(base["Mstar"], positive_only=True),
         "M_star_Msun_with_missing": summarize_samples(
-            base["Mstar"] * mstar_missing, positive_only=True
+            base["Mstar"], positive_only=True
         ),
     }
 
@@ -370,11 +392,9 @@ def estimate_photometric_uncertainties_mc(
             "M_r_mag": summarize_samples(base["M_r"], positive_only=False),
             "L_r_Lsun": summarize_samples(base["Lr_Lsun"], positive_only=True),
             "M_over_L_r": summarize_samples(ML_sys, positive_only=True),
-            "M_star_Msun": summarize_samples(
-                Mstar_sys * mhalo_missing, positive_only=True
-            ),
+            "M_star_Msun": summarize_samples(Mstar_sys, positive_only=True),
             "M_star_Msun_with_missing": summarize_samples(
-                Mstar_sys * mstar_missing, positive_only=True
+                Mstar_sys, positive_only=True
             ),
         }
 
@@ -593,11 +613,138 @@ def expdisk_frac_enclosed(R_over_h: float) -> float:
 
 # ------------------ I/O ------------------
 def load_input_dict(path: str) -> dict:
-    text = open(path, "r").read().strip()
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read().strip()
     try:
-        return json.loads(text)
+        result = json.loads(text)
     except json.JSONDecodeError:
-        return ast.literal_eval(text)
+        result = ast.literal_eval(text)
+    if not isinstance(result, dict):
+        raise ValueError(f"Input must contain a dictionary: {path}")
+    return result
+
+
+def load_profile_magnitudes(path: str) -> dict:
+    """Read the compact g/r JSON written by legacy_ellipse_profile.py."""
+    with open(path, "r", encoding="utf-8") as f:
+        values = json.load(f)
+    if not isinstance(values, dict):
+        raise ValueError(f"Magnitude JSON must contain an object: {path}")
+    for band in ("g", "r"):
+        value = as_float_or_none(values.get(band))
+        if value is None:
+            raise ValueError(
+                f"Magnitude JSON needs a finite '{band}' value; run both "
+                f"g and r profiles into the same magnitude file: {path}"
+            )
+        values[band] = value
+        error_key = f"{band}_err"
+        error = values.get(error_key)
+        if error is not None:
+            error = as_float_or_none(error)
+            if error is None or error < 0:
+                raise ValueError(f"Magnitude JSON has invalid '{error_key}': {path}")
+        values[error_key] = error
+    radius = values.get("r_reff_arcsec")
+    if radius is not None:
+        radius = as_float_or_none(radius)
+        if radius is None or radius <= 0:
+            raise ValueError(f"Magnitude JSON has invalid 'r_reff_arcsec': {path}")
+    values["r_reff_arcsec"] = radius
+    return values
+
+
+def as_float_or_none(x):
+    if x is None:
+        return None
+    try:
+        xf = float(x)
+    except Exception:
+        return None
+    return xf if np.isfinite(xf) else None
+
+
+def choose_redshift_from_input(d: dict):
+    """
+    Prefer spectroscopic redshift for all distance-dependent quantities.
+
+    Supported keys, in priority order:
+      zspec, z_spec, z_spectroscopic, z
+
+    Liao photometric redshift is retained as provenance/diagnostic only.
+    """
+    priority = [
+        ("zspec", "spectroscopic redshift from input key 'zspec'"),
+        ("z_spec", "spectroscopic redshift from input key 'z_spec'"),
+        ("z_spectroscopic", "spectroscopic redshift from input key 'z_spectroscopic'"),
+        ("z", "redshift from input key 'z'"),
+        ("z_phot_liao", "Liao+2023 photometric redshift"),
+    ]
+
+    for key, desc in priority:
+        zval = as_float_or_none(d.get(key, None))
+        if zval is not None and zval > 0:
+            return zval, key, desc
+
+    raise KeyError(
+        "No usable redshift found. Provide one of: zspec, z_spec, "
+        "z_spectroscopic, z, or z_phot_liao."
+    )
+
+
+def choose_redshift_error_from_input(cli_value, d: dict, z_key_used: str):
+    """
+    Pick the uncertainty corresponding to the redshift actually used.
+    CLI --z_err overrides everything.
+    """
+    if cli_value is not None:
+        return float(cli_value)
+
+    if z_key_used == "zspec":
+        keys = ["zspec_err", "z_spec_err", "z_err"]
+    elif z_key_used == "z_spec":
+        keys = ["z_spec_err", "zspec_err", "z_err"]
+    elif z_key_used == "z_spectroscopic":
+        keys = ["z_spectroscopic_err", "zspec_err", "z_spec_err", "z_err"]
+    elif z_key_used == "z_phot_liao":
+        keys = ["z_phot_liao_err", "z_err"]
+    else:
+        keys = ["z_err", "zspec_err", "z_spec_err", "z_phot_liao_err"]
+
+    for key in keys:
+        val = as_float_or_none(d.get(key, None))
+        if val is not None and val >= 0:
+            return val
+
+    return None
+
+
+def liao_redshift_diagnostic(d: dict, z_used: float):
+    """
+    Return a simple diagnostic comparing the adopted redshift to the Liao photo-z.
+    """
+    z_phot = as_float_or_none(d.get("z_phot_liao", None))
+    z_phot_err = as_float_or_none(d.get("z_phot_liao_err", None))
+
+    if z_phot is None:
+        return None
+
+    out = {
+        "z_phot_liao": z_phot,
+        "z_phot_liao_err": z_phot_err,
+        "z_used_minus_z_phot_liao": z_used - z_phot,
+    }
+
+    if z_phot_err is not None and z_phot_err > 0:
+        nsig = abs(z_used - z_phot) / z_phot_err
+        out["difference_in_liao_sigma"] = nsig
+        if nsig > 5:
+            out["warning"] = (
+                "Adopted redshift differs from Liao photo-z by >5 sigma. "
+                "Check whether zspec has a missing digit or decimal-place error."
+            )
+
+    return out
 
 
 # ------------------ Main ------------------
@@ -606,7 +753,11 @@ def main():
         description="Estimate stellar mass and M200 (Astropy). Includes MC uncertainty propagation for color, M/L, luminosity, and stellar mass.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    ap.add_argument("input_file", type=str, help="Path to file with the input dict")
+    ap.add_argument("input_file", type=str, help="Galaxy data JSON/dict (without magnitudes)")
+    ap.add_argument(
+        "magnitudes_file", type=str,
+        help="Combined g/r .magnitudes.json from legacy_ellipse_profile.py",
+    )
 
     # Photometry/IMF
     ap.add_argument(
@@ -617,7 +768,6 @@ def main():
         help="Color–M/L relation",
     )
     ap.add_argument("--M_r_sun", type=float, default=4.64, help="Solar |M_r| (AB)")
-
     # Cosmology
     ap.add_argument(
         "--planck18", action="store_true", help="Use astropy.cosmology.Planck18"
@@ -636,8 +786,8 @@ def main():
     ap.add_argument(
         "--shmr_model",
         type=str,
-        default="moster13",
-        choices=["moster13", "umachine", "fixed"],
+        default="umachine",
+        choices=["moster13", "umachine"],
         help="SHMR for halo mass from M*",
     )
     ap.add_argument(
@@ -678,30 +828,29 @@ def main():
         help="log10 scatter in concentration (MC)",
     )
     ap.add_argument(
-        "--missing_stellar",
+        "--target_halo_sigma",
         type=float,
-        default=None,
-        help="Missing stellar mass override",
+        default=0,
+        help="Target percentage of CDM halo mass from SHMR inversion, -1sigma = p16 0=median +1sigma=p84",
     )
     ap.add_argument(
-        "--missing_halo",
+        "--target_ml_sigma",
         type=float,
-        default=None,
-        help="Missing halo mass override",
+        default=0,
+        help="Target percentage of median computed M/L, -1sigma = p16 0=median +1sigma=p84",
     )
-
     # Optional photometric / redshift uncertainties
     ap.add_argument(
         "--g_err",
         type=float,
         default=None,
-        help="1σ uncertainty in g magnitude [mag]. If omitted, use input dict key 'g_err' if present.",
+        help="1σ uncertainty in g magnitude [mag]. Overrides magnitude JSON g_err.",
     )
     ap.add_argument(
         "--r_err",
         type=float,
         default=None,
-        help="1σ uncertainty in r magnitude [mag]. If omitted, use input dict key 'r_err' if present.",
+        help="1σ uncertainty in r magnitude [mag]. Overrides magnitude JSON r_err.",
     )
     ap.add_argument(
         "--z_err",
@@ -731,25 +880,51 @@ def main():
             "Set to 0 to disable."
         ),
     )
+    ap.add_argument(
+        "--disk_luminosity_adj",
+        type=float,
+        default=1.0,
+        help=("Manual adjustment to luminosity to account for mass stripped away"),
+    )
+    ap.add_argument(
+        "--bulge_luminosity_adj",
+        type=float,
+        default=1.0,
+        help=("Manual adjustment to luminosity to account for mass stripped away"),
+    )
 
     args = ap.parse_args()
 
     # --- Load input dict ---
     d = load_input_dict(args.input_file)
+    phot = load_profile_magnitudes(args.magnitudes_file)
 
     def pick_optional_float(cli_value, dict_key):
-        v = cli_value if cli_value is not None else d.get(dict_key, None)
+        v = cli_value if cli_value is not None else phot.get(dict_key, None)
         return None if v is None else float(v)
 
-    z = float(d["z"])
-    g = float(d["g"])
-    r = float(d["r"])
-    ra = float(d["ra"])
-    dec = float(d["dec"])
+    z, z_key_used, z_used_desc = choose_redshift_from_input(d)
+
+    g = phot["g"]
+    r = phot["r"]
+    ra = float(d.get("ra", np.nan))
+    dec = float(d.get("dec", np.nan))
+
+    z_phot_liao = as_float_or_none(d.get("z_phot_liao", None))
+    z_phot_liao_err = as_float_or_none(d.get("z_phot_liao_err", None))
+    z_source_label = d.get("z_source", z_used_desc)
+
+    target_halo_sigma = d.get("target_halo_sigma", args.target_halo_sigma)
+    target_ml_sigma = d.get("target_ml_sigma", args.target_ml_sigma)
+
+    disk_luminosity_adj = d.get("disk_luminosity_adj", args.disk_luminosity_adj)
+    bulge_luminosity_adj = d.get("bulge_luminosity_adj", args.disk_luminosity_adj)
 
     g_err = pick_optional_float(args.g_err, "g_err")
     r_err = pick_optional_float(args.r_err, "r_err")
-    z_err_in = pick_optional_float(args.z_err, "z_err")
+    z_err_in = choose_redshift_error_from_input(args.z_err, d, z_key_used)
+
+    z_diagnostic = liao_redshift_diagnostic(d, z)
 
     ml_systematic_dex = (
         default_ml_systematic_dex(args.ml)
@@ -757,26 +932,19 @@ def main():
         else float(args.ml_systematic_dex)
     )
 
-    Re_arcsec = float(d.get("Reff_r_arcsec", np.nan))
+    # The profile radius is circularized; retain the old data-file radius as a
+    # fallback for magnitude files generated before this field was added.
+    Re_arcsec = phot["r_reff_arcsec"]
+    if Re_arcsec is None:
+        Re_arcsec = as_float_or_none(d.get("Reff_r_arcsec"))
+    Re_arcsec = float("nan") if Re_arcsec is None else Re_arcsec
     sersic_n = float(d.get("sersic_n", 4.0))
-    a_pix = d.get("A_pix", None)
-    b_pix = d.get("B_pix", None)
-    b_over_a_raw = None if a_pix is None or b_pix is None else b_pix / a_pix
+    b_over_a_raw = d.get("b/a", None)
     b_over_a = None if b_over_a_raw is None else float(b_over_a_raw)
     a_over_b = None if (b_over_a is None or b_over_a <= 0) else 1.0 / b_over_a
 
     DT_raw = d.get("D/T", d.get("D_over_T", 0.0))
     DT = float(max(0.0, min(1.0, DT_raw if DT_raw is not None else 0.0)))
-
-    if args.missing_stellar is None:
-        mstar_missing = float(d.get("mstar_missing", 1.0))
-    else:
-        mstar_missing = float(args.missing_stellar)
-
-    if args.missing_halo is None:
-        mhalo_missing = float(d.get("mhalo_missing", 1.0))
-    else:
-        mhalo_missing = float(args.missing_halo)
 
     if args.c200 is None:
         c_input = d.get("c", d.get("c200", None))
@@ -789,8 +957,6 @@ def main():
         c_input = args.c200
 
     Re_bulge_arcsec = d.get("Re_bulge_arcsec", None)
-    Re_disk_arcsec = d.get("Re_disk_arcsec", None)
-    Rd_exp_arcsec = d.get("Rd_exp_arcsec", None)
 
     # --- Cosmology & H(z) ---
     cosmo = (
@@ -804,15 +970,22 @@ def main():
     Hz = cosmo.H(z).to(u.km / u.s / u.Mpc)
     Hz_val = Hz.value
 
-    # --- K-corrections & rest-frame photometry ---
+    # --- K-corrections & rest-frame colour ---
     gmr_obs = g - r
     Kg = kpoly(z, gmr_obs, B_g)
     Kr = kpoly(z, gmr_obs, B_r)
+
     g0 = g - Kg
     r0 = r - Kr
     gmr0 = g0 - r0
+
+    # Diagnostics:
+    #   M_r_photometric uses the script's rest-frame K-corrected convention.
+    #   M_r_noK uses the closer Liao convention: dereddened apparent r minus DM.
     mu = cosmo.distmod(z).value
     M_r = r0 - mu
+    M_r_noK = r - mu
+    M_r_source = "computed_from_r_z_Kr"
 
     # --- Luminosity & stellar mass ---
     Lr_Lsun = 10.0 ** (-0.4 * (M_r - args.M_r_sun))
@@ -826,10 +999,6 @@ def main():
         ML = mlr_bell2003_diet_gr(gmr0)
         ml_name = "Bell+2003 (diet Salpeter)"
 
-    Mstar_base_Msun = ML * Lr_Lsun
-    Mstar_Msun_with_stripped = Mstar_base_Msun * mstar_missing
-    Mstar_Msun = Mstar_base_Msun * mhalo_missing
-
     uncertainty_mc = estimate_photometric_uncertainties_mc(
         g=g,
         r=r,
@@ -837,8 +1006,6 @@ def main():
         ml_mode=args.ml,
         M_r_sun=args.M_r_sun,
         cosmo=cosmo,
-        mstar_missing=mstar_missing,
-        mhalo_missing=mhalo_missing,
         g_err=g_err,
         r_err=r_err,
         z_err=z_err_in,
@@ -846,10 +1013,15 @@ def main():
         systematic_dex=ml_systematic_dex,
         seed=args.ml_mc_seed,
     )
+    ML *= 10 ** (ml_systematic_dex * target_ml_sigma)
+    Mbulge_Msun = ML * Lr_Lsun
 
     # --- Disk/Bulge split ---
-    Mdisk_Msun = Mstar_Msun_with_stripped * DT
-    Mbulge_Msun = Mstar_Msun_with_stripped * (1.0 - DT)
+    # Assume photometry is for the bulge
+    Mdisk_Msun = Mbulge_Msun * DT / (1 - DT) * disk_luminosity_adj
+    Mbulge_Msun *= bulge_luminosity_adj
+    Mstar_Msun = Mbulge_Msun + Mdisk_Msun
+    DT_init = Mdisk_Msun / Mstar_Msun
 
     # --- Angular → physical scales ---
     kpc_per_arcsec = cosmo.angular_diameter_distance(z).to_value(u.kpc) * (
@@ -857,32 +1029,9 @@ def main():
     )
 
     # --- Component sizes (arcsec) with heuristics if missing ---
-    Re_gal_arcsec = Re_arcsec if np.isfinite(Re_arcsec) else float("nan")
-    if Re_bulge_arcsec is None:
-        Re_bulge_arcsec = (
-            (0.6 * Re_gal_arcsec)
-            if (np.isfinite(Re_gal_arcsec) and DT > 0.0)
-            else Re_gal_arcsec
-        )
-    Re_bulge_arcsec = (
-        float(Re_bulge_arcsec) if Re_bulge_arcsec is not None else float("nan")
-    )
+    Re_bulge_arcsec = Re_arcsec if np.isfinite(Re_arcsec) else float("nan")
 
-    if Rd_exp_arcsec is not None:
-        h_disk_arcsec = float(Rd_exp_arcsec)
-        Re_disk_arcsec_used = 1.678 * h_disk_arcsec
-    elif Re_disk_arcsec is not None:
-        Re_disk_arcsec_used = float(Re_disk_arcsec)
-        h_disk_arcsec = Re_disk_arcsec_used / 1.678
-    else:
-        if np.isfinite(Re_gal_arcsec) and DT > 0.0:
-            Re_disk_arcsec_used = 1.3 * Re_gal_arcsec
-            h_disk_arcsec = Re_disk_arcsec_used / 1.678
-        else:
-            Re_disk_arcsec_used = float("nan")
-            h_disk_arcsec = float("nan")
-
-    Re_ap_arcsec = Re_gal_arcsec
+    Re_ap_arcsec = Re_bulge_arcsec
     Re_ap_reason = "as-provided"
     Re_ap_kpc = Re_ap_arcsec * kpc_per_arcsec
 
@@ -909,104 +1058,68 @@ def main():
                 "model": "Moster+2013 (z~0)",
                 "M200c_Msun": M200,
                 "V200_kms": V200,
-                "Mstar_over_M200": (
-                    (Mstar_Msun_with_stripped / M200) if M200 > 0 else None
-                ),
+                "Mstar_over_M200": ((Mstar_Msun / M200) if M200 > 0 else None),
                 "Mbulge_over_M200": (Mbulge_Msun / M200) if M200 > 0 else None,
                 "Mdisk_over_M200": (Mdisk_Msun / M200) if M200 > 0 else None,
             }
         )
-        hs = halo_structure_from_M200(M200, z, cosmo, c_input)
-        shmr["halo_structure"] = hs
+        hs_target = halo_structure_from_M200(M200, z, cosmo, c_input)
+        shmr["halo_structure"] = hs_target
         shmr["a_bulge_kpc"] = a_bulge_kpc
         shmr["a_bulge_over_a_halo"] = (
-            (a_bulge_kpc / hs["a_halo_kpc"]) if np.isfinite(a_bulge_kpc) else None
-        )
-
-    elif args.shmr_model == "umachine":
-        med = m200_um_median(Mstar_eff, z, args.gal_type) * (10.0**args.shmr_shift_dex)
-        scatter = max(0.0, args.um_scatter_dex)
-        p16, p84 = med / (10.0**scatter), med * (10.0**scatter)
-        shmr.update(
-            {
-                "model": "UM/lensing (z~0)",
-                "M200c_median_Msun": med,
-                "M200c_p16_Msun": p16,
-                "M200c_p84_Msun": p84,
-                "V200_median_kms": v200_from_m200(med, z, cosmo).to_value(u.km / u.s),
-                "V200_p16_kms": v200_from_m200(p16, z, cosmo).to_value(u.km / u.s),
-                "V200_p84_kms": v200_from_m200(p84, z, cosmo).to_value(u.km / u.s),
-                "Mstar_over_M200_median": (
-                    (Mstar_Msun_with_stripped / med) if med > 0 else None
-                ),
-                "Mstar_over_M200_p16": (
-                    (Mstar_Msun_with_stripped / p16) if p16 > 0 else None
-                ),
-                "Mstar_over_M200_p84": (
-                    (Mstar_Msun_with_stripped / p84) if p84 > 0 else None
-                ),
-                "Mbulge_over_M200_median": (Mbulge_Msun / med) if med > 0 else None,
-                "Mbulge_over_M200_p16": (Mbulge_Msun / p16) if p16 > 0 else None,
-                "Mbulge_over_M200_p84": (Mbulge_Msun / p84) if p84 > 0 else None,
-                "Mdisk_over_M200_median": (Mdisk_Msun / med) if med > 0 else None,
-                "Mdisk_over_M200_p16": (Mdisk_Msun / p16) if p16 > 0 else None,
-                "Mdisk_over_M200_p84": (Mdisk_Msun / p84) if p84 > 0 else None,
-                "scatter_dex": scatter,
-            }
-        )
-        hs_med = halo_structure_from_M200(med, z, cosmo, c_input)
-        hs_p16 = halo_structure_from_M200(p16, z, cosmo, c_input)
-        hs_p84 = halo_structure_from_M200(p84, z, cosmo, c_input)
-        shmr["halo_structure_median"] = hs_med
-        shmr["halo_structure_p16"] = hs_p16
-        shmr["halo_structure_p84"] = hs_p84
-        shmr["a_bulge_kpc"] = a_bulge_kpc
-        shmr["Re_bulge_kpc"] = Re_bulge_kpc
-        shmr["a_bulge_over_a_halo_median"] = (
-            (a_bulge_kpc / hs_med["a_halo_kpc"]) if np.isfinite(a_bulge_kpc) else None
-        )
-        shmr["a_bulge_over_a_halo_p16"] = (
-            (a_bulge_kpc / hs_p16["a_halo_kpc"]) if np.isfinite(a_bulge_kpc) else None
-        )
-        shmr["a_bulge_over_a_halo_p84"] = (
-            (a_bulge_kpc / hs_p84["a_halo_kpc"]) if np.isfinite(a_bulge_kpc) else None
+            (a_bulge_kpc / hs_target["a_halo_kpc"])
+            if np.isfinite(a_bulge_kpc)
+            else None
         )
 
     else:
-        med = 1.5e12
+        med = m200_um_median(Mstar_eff, z, args.gal_type) * (10.0**args.shmr_shift_dex)
         scatter = max(0.0, args.um_scatter_dex)
-        p16, p84 = med / (10.0**scatter), med * (10.0**scatter)
+        p16, p84 = med * (10.0**-scatter), med * (10.0**scatter)
+        target_p = med * 10 ** (scatter * target_halo_sigma)
+
         shmr.update(
             {
-                "model": "Fixed M200",
-                "M200c_median_Msun": med,
+                "model": "UM/lensing (z~0)",
+                "target_halo_sigma": target_halo_sigma,
+                "scatter_dex": scatter,
+                "M200c_target_Msun": target_p,
                 "M200c_p16_Msun": p16,
                 "M200c_p84_Msun": p84,
-                "V200_median_kms": v200_from_m200(med, z, cosmo).to_value(u.km / u.s),
+                "V200_target_kms": v200_from_m200(target_p, z, cosmo).to_value(
+                    u.km / u.s
+                ),
                 "V200_p16_kms": v200_from_m200(p16, z, cosmo).to_value(u.km / u.s),
                 "V200_p84_kms": v200_from_m200(p84, z, cosmo).to_value(u.km / u.s),
-                "Mstar_over_M200_median": (Mstar_Msun / med) if med > 0 else None,
-                "Mstar_over_M200_p16": (Mstar_Msun / p16) if p16 > 0 else None,
-                "Mstar_over_M200_p84": (Mstar_Msun / p84) if p84 > 0 else None,
-                "Mbulge_over_M200_median": (Mbulge_Msun / med) if med > 0 else None,
+                "Mstar_over_M200_target": (
+                    (Mstar_Msun / target_p) if target_p > 0 else None
+                ),
+                "Mstar_over_M200_p16": ((Mstar_Msun / p16) if p16 > 0 else None),
+                "Mstar_over_M200_p84": ((Mstar_Msun / p84) if p84 > 0 else None),
+                "Mbulge_over_M200_target": (
+                    (Mbulge_Msun / target_p) if target_p > 0 else None
+                ),
                 "Mbulge_over_M200_p16": (Mbulge_Msun / p16) if p16 > 0 else None,
                 "Mbulge_over_M200_p84": (Mbulge_Msun / p84) if p84 > 0 else None,
-                "Mdisk_over_M200_median": (Mdisk_Msun / med) if med > 0 else None,
+                "Mdisk_over_M200_target": (
+                    (Mdisk_Msun / target_p) if target_p > 0 else None
+                ),
                 "Mdisk_over_M200_p16": (Mdisk_Msun / p16) if p16 > 0 else None,
                 "Mdisk_over_M200_p84": (Mdisk_Msun / p84) if p84 > 0 else None,
-                "scatter_dex": scatter,
             }
         )
-        hs_med = halo_structure_from_M200(med, z, cosmo, c_input)
+        hs_target = halo_structure_from_M200(target_p, z, cosmo, c_input)
         hs_p16 = halo_structure_from_M200(p16, z, cosmo, c_input)
         hs_p84 = halo_structure_from_M200(p84, z, cosmo, c_input)
-        shmr["halo_structure_median"] = hs_med
+        shmr["halo_structure_target"] = hs_target
         shmr["halo_structure_p16"] = hs_p16
         shmr["halo_structure_p84"] = hs_p84
         shmr["a_bulge_kpc"] = a_bulge_kpc
         shmr["Re_bulge_kpc"] = Re_bulge_kpc
-        shmr["a_bulge_over_a_halo_median"] = (
-            (a_bulge_kpc / hs_med["a_halo_kpc"]) if np.isfinite(a_bulge_kpc) else None
+        shmr["a_bulge_over_a_halo_target"] = (
+            (a_bulge_kpc / hs_target["a_halo_kpc"])
+            if np.isfinite(a_bulge_kpc)
+            else None
         )
         shmr["a_bulge_over_a_halo_p16"] = (
             (a_bulge_kpc / hs_p16["a_halo_kpc"]) if np.isfinite(a_bulge_kpc) else None
@@ -1026,26 +1139,29 @@ def main():
         "inputs": {
             "ra": ra,
             "dec": dec,
+            "name": d.get("name", None),
+            "ra_icrs": d.get("ra_icrs", None),
+            "dec_icrs": d.get("dec_icrs", None),
             "z": z,
+            "z_key_used": z_key_used,
+            "z_used_description": z_used_desc,
+            "z_source": z_source_label,
+            "z_phot_liao": z_phot_liao,
+            "z_phot_liao_err": z_phot_liao_err,
+            "z_diagnostic": z_diagnostic,
             "g": g,
             "r": r,
             "g_err": g_err,
             "r_err": r_err,
+            "magnitudes_file": args.magnitudes_file,
             "z_err": z_err_in,
             "dereddened": True,
+            "M_r_source": M_r_source,
             "Reff_r_arcsec": (
-                None if not np.isfinite(Re_gal_arcsec) else float(Re_gal_arcsec)
+                None if not np.isfinite(Re_bulge_arcsec) else float(Re_bulge_arcsec)
             ),
             "Re_bulge_arcsec": (
                 None if not np.isfinite(Re_bulge_arcsec) else float(Re_bulge_arcsec)
-            ),
-            "Re_disk_arcsec": (
-                None
-                if not np.isfinite(Re_disk_arcsec_used)
-                else float(Re_disk_arcsec_used)
-            ),
-            "Rd_exp_arcsec": (
-                None if not np.isfinite(h_disk_arcsec) else float(h_disk_arcsec)
             ),
             "sersic_n": sersic_n,
             "b_over_a": b_over_a,
@@ -1055,14 +1171,41 @@ def main():
         },
         "cosmology": {"model": cosmo_label, "H_z_km_s_Mpc": Hz_val},
         "k_corrections": {"Kg_mag": Kg, "Kr_mag": Kr, "g_minus_r_obs": gmr_obs},
-        "rest_frame": {"(g-r)_0": gmr0, "M_r_mag": M_r},
+        "rest_frame": {
+            "g0": g0,
+            "r0": r0,
+            "(g-r)_0": gmr0,
+            "M_r_mag": M_r,
+            "M_r_source": M_r_source,
+            "M_r_noK_mag": M_r_noK,
+            "distance_modulus_mag": mu,
+        },
         "luminosity": {"L_r_Lsun": Lr_Lsun, "M_r_sun_mag": args.M_r_sun},
+        "sizes": {
+            "Reff_r_arcsec": (
+                None if not np.isfinite(Re_bulge_arcsec) else float(Re_bulge_arcsec)
+            ),
+            "Reff_r_kpc": None if not np.isfinite(Re_ap_kpc) else float(Re_ap_kpc),
+            "Reff_definition": (
+                "Sérsic-corrected circularized r-band radius from legacy_ellipse_profile"
+                if phot["r_reff_arcsec"] is not None
+                else d.get("Reff_definition", "Galaxy input Reff_r_arcsec")
+            ),
+            "kpc_per_arcsec": kpc_per_arcsec,
+            "Re_bulge_kpc": (
+                None if not np.isfinite(Re_bulge_kpc) else float(Re_bulge_kpc)
+            ),
+            "a_bulge_kpc": None if not np.isfinite(a_bulge_kpc) else float(a_bulge_kpc),
+        },
         "stellar_mass": {
+            "target_ml_sigma": target_ml_sigma,
+            "bulge_luminosity_adj": bulge_luminosity_adj,
+            "disk_luminosity_adj": disk_luminosity_adj,
+            "D_over_T_init": DT_init,
             "M_over_L_r": ML,
+            "M_bulge_Msun": Mbulge_Msun,
+            "M_disk_Msun": Mdisk_Msun,
             "M_star_Msun": Mstar_Msun,
-            "M_star_Msun_with_missing": Mstar_Msun_with_stripped,
-            "Stellar Missing": mstar_missing,
-            "Halo Missing": mhalo_missing,
             "ML_method": ml_name,
             "D_over_T": DT,
             "M_bulge_Msun": Mbulge_Msun,
@@ -1082,23 +1225,24 @@ def main():
         print(json.dumps(out_fmt, indent=2))
     else:
         print("\n=== Inputs ===")
-        print(f"z = {s3(z)}, g = {s5(g)}, r = {s5(r)}  (dereddened)")
+        print(f"z = {s3(z)} [{z_key_used}], g = {s5(g)}, r = {s5(r)}  (dereddened)")
+        if z_phot_liao is not None:
+            msg = f"Liao photo-z = {s3(z_phot_liao)}"
+            if z_phot_liao_err is not None:
+                msg += f" ± {s3(z_phot_liao_err)}"
+            print(msg)
+        if z_diagnostic is not None and "warning" in z_diagnostic:
+            print(f"WARNING: {z_diagnostic['warning']}")
         if g_err is not None or r_err is not None or z_err_in is not None:
             print(
                 f"input uncertainties: g_err = {s3(g_err) if g_err is not None else 'None'} mag, "
                 f"r_err = {s3(r_err) if r_err is not None else 'None'} mag, "
                 f"z_err = {s3(z_err_in) if z_err_in is not None else 'None'}"
             )
-        if np.isfinite(Re_gal_arcsec):
-            print(f"Reff_r (galaxy) = {s3(Re_gal_arcsec)} arcsec")
+        if np.isfinite(Re_bulge_arcsec):
+            print(f"Reff_r (circularized) = {s3(Re_bulge_arcsec)} arcsec")
         if np.isfinite(Re_bulge_arcsec):
             print(f"Re_bulge = {s3(Re_bulge_arcsec)} arcsec")
-        if np.isfinite(h_disk_arcsec):
-            print(
-                f"Rd_exp (disk scale h) = {s3(h_disk_arcsec)} arcsec  (Re_disk ≈ {s3(1.678 * h_disk_arcsec)} arcsec)"
-            )
-        elif np.isfinite(Re_disk_arcsec_used):
-            print(f"Re_disk = {s3(Re_disk_arcsec_used)} arcsec")
         print(f"Sérsic n (bulge) = {s3(sersic_n)}")
         if b_over_a is not None:
             print(f"b/a = {s3(b_over_a)}  →  a/b = {s3(a_over_b)}")
@@ -1110,8 +1254,11 @@ def main():
         print(f"K_g = {s5(Kg)} mag,  K_r = {s5(Kr)} mag   (obs (g-r)={s5(gmr_obs)})")
 
         print("\n=== Rest-frame & luminosity ===")
+        print(f"g0 = {g0} mag")
+        print(f"r0 = {r0} mag")
         print(f"(g-r)_0 = {s5(gmr0)}")
-        print(f"M_r = {s5(M_r)} mag")
+        print(f"M_r = {s5(M_r)} mag [{M_r_source}]")
+        print(f"M_r from r,z without K-correction = {s5(M_r_noK)} mag")
         print(f"L_r = {sci3(Lr_Lsun)} L_sun,r  (M_r,Sun={s5(args.M_r_sun)})")
 
         print("\n=== Stellar mass (luminous) & bulge/disk split ===")
@@ -1194,29 +1341,29 @@ def main():
                     print(f"  a_bulge/a_halo = {s3(s['a_bulge_over_a_halo'])}")
         else:
             print(
-                f"{s['model']} (median): M200c = {sci3(s['M200c_median_Msun'])} Msun,  "
-                f"V200 = {s3(s['V200_median_kms'])} km/s"
+                f"{s['model']} (target): M200c = {sci3(s['M200c_target_Msun'])} Msun,  "
+                f"V200 = {s3(s['V200_target_kms'])} km/s"
             )
             print(
-                f"  M*/M200 = {s3(s['Mstar_over_M200_median'])}  "
+                f"  M*/M200 = {s3(s['Mstar_over_M200_target'])}  "
                 f"(68%: {s3(s['Mstar_over_M200_p16'])}–{s3(s['Mstar_over_M200_p84'])})"
             )
             print(
-                f"  M_bulge/M200 = {s3(s['Mbulge_over_M200_median'])}  "
+                f"  M_bulge/M200 = {s3(s['Mbulge_over_M200_target'])}  "
                 f"(68%: {s3(s['Mbulge_over_M200_p16'])}–{s3(s['Mbulge_over_M200_p84'])})"
             )
             print(
-                f"  M_disk/M200 = {s3(s['Mdisk_over_M200_median'])}  "
+                f"  M_disk/M200 = {s3(s['Mdisk_over_M200_target'])}  "
                 f"(68%: {s3(s['Mdisk_over_M200_p16'])}–{s3(s['Mdisk_over_M200_p84'])})"
             )
-            hs = s["halo_structure_median"]
+            hs = s["halo_structure_target"]
             print(
-                f"  R200 (median) = {s3(hs['R200_kpc'])} kpc,  c = {s3(hs['c_used'])},  "
-                f"r_s = {s3(hs['r_s_kpc'])} kpc,  a_halo = {s3(hs['a_halo_kpc'])} kpc"
+                f"  R200 (target) = {s3(hs_target['R200_kpc'])} kpc,  c = {s3(hs_target['c_used'])},  "
+                f"r_s = {s3(hs_target['r_s_kpc'])} kpc,  a_halo = {s3(hs_target['a_halo_kpc'])} kpc"
             )
             if np.isfinite(a_bulge_kpc):
                 print(
-                    f"  a_bulge/a_halo (median) = {s3(s['a_bulge_over_a_halo_median'])}"
+                    f"  a_bulge/a_halo (target) = {s3(s['a_bulge_over_a_halo_target'])}"
                 )
         print()
 
