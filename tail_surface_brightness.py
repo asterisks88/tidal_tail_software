@@ -29,13 +29,23 @@ import argparse
 import csv
 import math
 import sys
+import warnings
 
 import astropy.units as u
 import numpy as np
+from astropy.coordinates import SkyCoord
 from astropy.io import fits
 from astropy.stats import sigma_clipped_stats
+from astropy.table import Table
+from astropy.units import UnitsWarning
 from astropy.wcs import WCS
 from astropy.wcs.utils import proj_plane_pixel_scales
+
+warnings.filterwarnings(
+    "ignore",
+    message=r".*did not parse as fits unit.*",
+    category=UnitsWarning,
+)
 
 try:
     from regions import Regions
@@ -102,6 +112,141 @@ def pixel_area_arcsec2(header):
     return sx * sy
 
 
+def find_col_case_insensitive(tab, name):
+    """Return actual table column name matching name case-insensitively."""
+    target = name.lower()
+    for col in tab.colnames:
+        if col.lower() == target:
+            return col
+    raise KeyError(
+        f"Could not find column {name!r}. Available columns include: "
+        f"{tab.colnames[:30]}"
+    )
+
+
+def table_column_as_deg_quantity(tab, colname):
+    """
+    Return a table column as an astropy Quantity in degrees.
+
+    Handles both unitless numeric FITS columns and Astropy Table columns
+    that already carry unit='deg'.
+    """
+    col = tab[colname]
+
+    if getattr(col, "unit", None) is not None:
+        return col.quantity.to(u.deg)
+
+    return np.asarray(col, dtype=float) * u.deg
+
+
+def tractor_transmission_from_region(
+    tractor_file,
+    region_weights,
+    header,
+    band="r",
+    min_sources=3,
+    min_region_weight=0.0,
+):
+    """
+    Estimate the Galactic transmission for a DS9 region using Tractor rows
+    whose RA/Dec fall inside the rasterized region.
+
+    Returns the median MW_TRANSMISSION_<band> and diagnostic statistics.
+
+    This uses nearest-pixel membership in the already rasterized region_weights.
+    For Galactic extinction this is sufficient because MW transmission varies
+    smoothly compared with the pixel scale.
+    """
+    band = band.lower().strip()
+    trans_col_requested = f"mw_transmission_{band}"
+
+    tab = Table.read(tractor_file, hdu=1)
+
+    ra_col = find_col_case_insensitive(tab, "ra")
+    dec_col = find_col_case_insensitive(tab, "dec")
+    trans_col = find_col_case_insensitive(tab, trans_col_requested)
+
+    ra_q = table_column_as_deg_quantity(tab, ra_col)
+    dec_q = table_column_as_deg_quantity(tab, dec_col)
+    trans = np.asarray(tab[trans_col], dtype=float)
+
+    valid = (
+        np.isfinite(ra_q.to_value(u.deg))
+        & np.isfinite(dec_q.to_value(u.deg))
+        & np.isfinite(trans)
+        & (trans > 0)
+    )
+
+    if not np.any(valid):
+        raise RuntimeError(
+            f"No valid rows found in {tractor_file} with finite RA/Dec and "
+            f"positive {trans_col}."
+        )
+
+    wcs = WCS(header)
+    coords = SkyCoord(ra=ra_q[valid], dec=dec_q[valid], frame="icrs")
+    x, y = wcs.world_to_pixel(coords)
+
+    ny, nx = region_weights.shape
+    xi = np.rint(x).astype(int)
+    yi = np.rint(y).astype(int)
+
+    in_bounds = (
+        np.isfinite(x) & np.isfinite(y) & (xi >= 0) & (xi < nx) & (yi >= 0) & (yi < ny)
+    )
+
+    valid_indices = np.where(valid)[0]
+    valid_indices = valid_indices[in_bounds]
+    xi = xi[in_bounds]
+    yi = yi[in_bounds]
+
+    if valid_indices.size == 0:
+        raise RuntimeError("No valid Tractor rows project onto the image footprint.")
+
+    inside_region = region_weights[yi, xi] > float(min_region_weight)
+    region_indices = valid_indices[inside_region]
+
+    if region_indices.size < int(min_sources):
+        raise RuntimeError(
+            f"Only {region_indices.size} Tractor source(s) found inside the "
+            f"tail region, fewer than --min-tractor-sources={min_sources}. "
+            f"Use a larger region, lower --min-tractor-sources, or fall back "
+            f"to a tail-centroid RA/Dec correction."
+        )
+
+    vals = trans[region_indices]
+    vals = vals[np.isfinite(vals) & (vals > 0)]
+
+    if vals.size < int(min_sources):
+        raise RuntimeError(
+            f"Only {vals.size} valid positive {trans_col} values found inside "
+            f"the tail region."
+        )
+
+    T_med = float(np.median(vals))
+    A_band = float(-2.5 * np.log10(T_med))
+
+    p16, p84 = np.percentile(vals, [16, 84])
+
+    return {
+        "method": "median_tractor_sources_inside_region",
+        "tractor_file": tractor_file,
+        "band": band,
+        "transmission_column": trans_col,
+        "n_sources": int(vals.size),
+        "mw_transmission_median": T_med,
+        "mw_transmission_mean": float(np.mean(vals)),
+        "mw_transmission_std": float(np.std(vals, ddof=1)) if vals.size > 1 else 0.0,
+        "mw_transmission_p16": float(p16),
+        "mw_transmission_p84": float(p84),
+        "mw_transmission_min": float(np.min(vals)),
+        "mw_transmission_max": float(np.max(vals)),
+        "A_band_mag": A_band,
+        "A_band_p16_mag": float(-2.5 * np.log10(p84)),
+        "A_band_p84_mag": float(-2.5 * np.log10(p16)),
+    }
+
+
 def nmgy_as2_to_mu(sb_nmgy_arcsec2):
     if not np.isfinite(sb_nmgy_arcsec2) or sb_nmgy_arcsec2 <= 0:
         return np.nan
@@ -157,6 +302,26 @@ def sigma_clipped_sky_sigma(data, good_sky):
         return np.nan, np.nan, np.nan
     mean, med, std = sigma_clipped_stats(vals, sigma=3.0, maxiters=5)
     return float(mean), float(med), float(std)
+
+
+def get_dereddening_metadata(header):
+    """
+    Extract dereddening metadata from the flux HDU header, if present.
+
+    Expected keywords written by mu_from_legacy.py:
+      DEREDDEN, DEREDBND, MWTRANS, A_BAND, DEREDRA, DEREDDEC
+    """
+    dered = bool(header.get("DEREDDEN", False))
+
+    return {
+        "dereddened": dered,
+        "dered_band": header.get("DEREDBND", ""),
+        "mw_transmission": header.get("MWTRANS", np.nan),
+        "A_band_mag": header.get("A_BAND", np.nan),
+        "dered_ra": header.get("DEREDRA", np.nan),
+        "dered_dec": header.get("DEREDDEC", np.nan),
+        "tractor_match_sep_arcsec": header.get("TRSEP", np.nan),
+    }
 
 
 def random_aperture_uncertainty(
@@ -241,6 +406,7 @@ def write_check_fits(
     sb_nmgy_arcsec2,
     mu_mag_arcsec2,
     fill_mode="nan",
+    dered_info=None,
 ):
     """
     Write a FITS file containing products useful for checking the measurement in DS9.
@@ -272,7 +438,19 @@ def write_check_fits(
     ph["MEANSB"] = (float(sb_nmgy_arcsec2), "Mean SB [nMgy/arcsec^2]")
     if np.isfinite(mu_mag_arcsec2):
         ph["MU_SB"] = (float(mu_mag_arcsec2), "Mean SB [mag/arcsec^2]")
-
+    if dered_info is not None:
+        ph["DEREDDEN"] = (True, "Fluxes corrected for Galactic extinction")
+        ph["DEREDMTH"] = ("REGION", "Dereddening method")
+        ph["DEREDBND"] = (dered_info["band"], "Band used for MW transmission")
+        ph["MWTRANS"] = (
+            dered_info["mw_transmission_median"],
+            "Median MW transmission in region",
+        )
+        ph["A_BAND"] = (dered_info["A_band_mag"], "Extinction correction [mag]")
+        ph["NTRSRC"] = (
+            dered_info["n_sources"],
+            "Tractor sources used for transmission median",
+        )
     hdus = [
         fits.PrimaryHDU(data=masked_nmgy, header=ph),
         fits.ImageHDU(
@@ -334,9 +512,13 @@ def main():
     ap.add_argument("mask_fits", help="Mask FITS; nonzero pixels are masked")
     ap.add_argument(
         "--flux-hdu",
-        default="SKY_SUB_NMGY",
-        help="Flux HDU to measure from (default: SKY_SUB_NMGY). "
-        "Use SKY_SUB_SMOOTH_NMGY if you want the smoothed flux image.",
+        default="DATA_NMGY",
+        help=(
+            "Flux HDU to measure from (default: DATA_NMGY). "
+            "For dereddened Legacy comparisons use SKY_SUB_DERED_NMGY. "
+            "Use SKY_SUB_SMOOTH_NMGY or SKY_SUB_SMOOTH_DERED_NMGY only if "
+            "you intentionally want the smoothed flux image."
+        ),
     )
     ap.add_argument(
         "--mask-hdu",
@@ -379,6 +561,55 @@ def main():
         default=12345,
         help="Random seed for aperture placement (default: 12345).",
     )
+    ap.add_argument(
+        "--tractor-fits",
+        default=None,
+        help=(
+            "Optional Legacy Tractor FITS catalog. Used with "
+            "--deredden-from-tractor-region to estimate MW_TRANSMISSION_<band> "
+            "from Tractor sources inside the DS9 region."
+        ),
+    )
+    ap.add_argument(
+        "--deredden-from-tractor-region",
+        action="store_true",
+        help=(
+            "Deredden the flux image by dividing by the median "
+            "MW_TRANSMISSION_<band> of Tractor sources inside the DS9 region."
+        ),
+    )
+    ap.add_argument(
+        "--dered-band",
+        choices=["g", "r", "z"],
+        default="r",
+        help="Band used for MW_TRANSMISSION_<band>.",
+    )
+    ap.add_argument(
+        "--min-tractor-sources",
+        type=int,
+        default=3,
+        help=(
+            "Minimum number of Tractor sources required inside the region "
+            "for region-median dereddening."
+        ),
+    )
+    ap.add_argument(
+        "--dered-region-min-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum rasterized region weight for a Tractor source to count "
+            "as inside the region. Default 0 means any overlap."
+        ),
+    )
+    ap.add_argument(
+        "--allow-double-deredden",
+        action="store_true",
+        help=(
+            "Allow dereddening even if the selected flux HDU is already marked "
+            "DEREDDEN=True. Normally this is blocked to avoid double correction."
+        ),
+    )
     args = ap.parse_args()
 
     flux_hdu = parse_hdu_spec(args.flux_hdu)
@@ -387,8 +618,9 @@ def main():
     data, hdr = read_hdu_data(args.mu_fits, flux_hdu)
     if data.ndim != 2:
         raise RuntimeError(f"Flux HDU must be 2D after squeeze(); got {data.shape}")
-
+    dered_meta = get_dereddening_metadata(hdr)
     pix_area = pixel_area_arcsec2(hdr)
+
     ext_mask = read_mask(args.mask_fits, mask_hdu=mask_hdu, expected_shape=data.shape)
     region_weights = build_region_weights(
         args.region_file, data.shape, hdr, subpixels=args.subpixels
@@ -399,7 +631,54 @@ def main():
             "Region does not overlap the image, or could not be rasterized."
         )
 
+    dered_info = None
+
+    if args.deredden_from_tractor_region:
+        if args.tractor_fits is None:
+            raise RuntimeError(
+                "--deredden-from-tractor-region requires --tractor-fits."
+            )
+
+        already_dered = bool(hdr.get("DEREDDEN", False))
+        if already_dered and not args.allow_double_deredden:
+            raise RuntimeError(
+                f"The selected flux HDU {args.flux_hdu!r} is already marked "
+                "DEREDDEN=True. Use SKY_SUB_NMGY instead, or pass "
+                "--allow-double-deredden if you really intend this."
+            )
+
+        dered_info = tractor_transmission_from_region(
+            tractor_file=args.tractor_fits,
+            region_weights=region_weights,
+            header=hdr,
+            band=args.dered_band,
+            min_sources=args.min_tractor_sources,
+            min_region_weight=args.dered_region_min_weight,
+        )
+
+        T_region = dered_info["mw_transmission_median"]
+
+        # Apply Galactic-extinction correction in flux space.
+        data = data / T_region
+
+        print()
+        print("=== Region-based Galactic dereddening ===")
+        print(f"Tractor file:             {args.tractor_fits}")
+        print(f"Band:                     {args.dered_band}")
+        print(f"Method:                   {dered_info['method']}")
+        print(f"Tractor sources used:     {dered_info['n_sources']}")
+        print(f"MW transmission median:   {T_region:.8f}")
+        print(
+            f"A_{args.dered_band}:                    {dered_info['A_band_mag']:.5f} mag"
+        )
+        print(
+            f"Transmission p16-p84:     "
+            f"{dered_info['mw_transmission_p16']:.8f} – "
+            f"{dered_info['mw_transmission_p84']:.8f}"
+        )
+
     finite = np.isfinite(data)
+
     valid_weights = np.where((~ext_mask) & finite, region_weights, 0.0)
 
     sumw = float(valid_weights.sum())
@@ -425,6 +704,7 @@ def main():
             sb_nmgy_arcsec2=sb_nmgy_arcsec2,
             mu_mag_arcsec2=mu_mag_arcsec2,
             fill_mode=args.check_fill,
+            dered_info=dered_info,
         )
         print()
         print(f"Wrote check FITS:         {args.write_check_fits}")
@@ -480,6 +760,22 @@ def main():
         "mask_fits": args.mask_fits,
         "flux_hdu": args.flux_hdu,
         "mask_hdu": args.mask_hdu if args.mask_hdu is not None else "first data HDU",
+        "dereddened": dered_info is not None,
+        "dered_method": "" if dered_info is None else dered_info["method"],
+        "dered_band": "" if dered_info is None else dered_info["band"],
+        "tractor_sources_for_dered": (
+            "" if dered_info is None else dered_info["n_sources"]
+        ),
+        "mw_transmission_region_median": (
+            "" if dered_info is None else dered_info["mw_transmission_median"]
+        ),
+        "mw_transmission_region_p16": (
+            "" if dered_info is None else dered_info["mw_transmission_p16"]
+        ),
+        "mw_transmission_region_p84": (
+            "" if dered_info is None else dered_info["mw_transmission_p84"]
+        ),
+        "A_band_mag": "" if dered_info is None else dered_info["A_band_mag"],
         "subpixels": args.subpixels,
         "nrand_requested": args.nrand,
         "nrand_used": nrand_ok,
@@ -511,6 +807,16 @@ def main():
     print()
     print("=== Region surface brightness measurement ===")
     print(f"Flux HDU:                 {args.flux_hdu}")
+    if dered_info is not None:
+        print(
+            f"Dereddened:               yes, region median "
+            f"MW_TRANSMISSION_{args.dered_band.upper()}="
+            f"{dered_info['mw_transmission_median']:.8f}, "
+            f"A_{args.dered_band}={dered_info['A_band_mag']:.5f} mag, "
+            f"N={dered_info['n_sources']}"
+        )
+    else:
+        print("Dereddened:               no")
     print(f"Mask FITS:                {args.mask_fits}")
     print(
         f"Mask HDU:                 {args.mask_hdu if args.mask_hdu is not None else 'first data HDU'}"
