@@ -2,6 +2,7 @@
 import argparse
 import csv
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -363,6 +364,76 @@ def segment_tube_score_robust(
     return float(q25 + mean_weight * mu - std_penalty * sig)
 
 
+def transverse_recenter_point(
+    I, usable, point, direction, half_width=8.0, along_sigma=2.0, max_shift=3.0
+):
+    """Recenter a point perpendicular to its local forward direction.
+
+    Use positive linear (already image-smoothed) intensity, a bounded transverse
+    window, and Gaussian averaging along the tail. ``usable`` must exclude star
+    masks, non-finite pixels, and pixels outside the selected tail component.
+    Displacements are capped; no displacement may cross unusable pixels. Leave
+    the point unchanged when support is insufficient. This does not fit a global
+    curve or constrain the total turning angle.
+    """
+    point = np.asarray(point, dtype=np.float64)
+    direction = np.asarray(direction, dtype=np.float64)
+    norm = np.linalg.norm(direction)
+    if (point.shape != (2,) or direction.shape != (2,)
+            or not np.all(np.isfinite(point))
+            or not np.isfinite(norm) or norm <= 0):
+        return point.copy()
+    if (not np.isfinite(half_width) or half_width <= 0
+            or not np.isfinite(along_sigma) or along_sigma <= 0
+            or not np.isfinite(max_shift) or max_shift < 0):
+        raise ValueError("Invalid transverse recentering window or maximum shift")
+    if max_shift == 0:
+        return point.copy()
+    tangent = direction / norm
+    normal = np.array([-tangent[1], tangent[0]])
+    h, w = I.shape
+    extent = half_width + 3.0 * along_sigma
+    xlo = max(0, int(np.floor(point[0] - extent)))
+    xhi = min(w, int(np.ceil(point[0] + extent)) + 1)
+    ylo = max(0, int(np.floor(point[1] - extent)))
+    yhi = min(h, int(np.ceil(point[1] + extent)) + 1)
+    if xhi <= xlo or yhi <= ylo:
+        return point.copy()
+
+    yy, xx = np.mgrid[ylo:yhi, xlo:xhi]
+    dx, dy = xx - point[0], yy - point[1]
+    along = dx * tangent[0] + dy * tangent[1]
+    cross = dx * normal[0] + dy * normal[1]
+    patch = I[ylo:yhi, xlo:xhi]
+    select = (usable[ylo:yhi, xlo:xhi] & np.isfinite(patch) & (patch > 0)
+              & (np.abs(along) <= 3.0 * along_sigma)
+              & (np.abs(cross) <= half_width))
+    if np.count_nonzero(select) < 3:
+        return point.copy()
+    weights = patch[select] * np.exp(-0.5 * (along[select] / along_sigma) ** 2)
+    # Scaling avoids under/overflow without changing the weighted centroid.
+    scale = float(np.max(weights))
+    if not np.isfinite(scale) or scale <= 0:
+        return point.copy()
+    weights = weights / scale
+    displacement = float(np.sum(cross[select] * weights) / np.sum(weights))
+    displacement = float(np.clip(displacement, -max_shift, max_shift))
+
+    # Back off near holes/boundaries instead of moving into or across a mask.
+    for fraction in (1.0, 0.5, 0.25, 0.125):
+        shift = fraction * displacement
+        if abs(shift) < 1e-8:
+            return point.copy()
+        trial = point + shift * normal
+        count = max(2, int(np.ceil(abs(shift) / 0.25)) + 1)
+        xs = np.rint(np.linspace(point[0], trial[0], count)).astype(int)
+        ys = np.rint(np.linspace(point[1], trial[1], count)).astype(int)
+        if (np.all((xs >= 0) & (xs < w) & (ys >= 0) & (ys < h))
+                and np.all(usable[ys, xs])):
+            return trial
+    return point.copy()
+
+
 def trace_tail_points_beam(
     component,
     I,
@@ -389,11 +460,22 @@ def trace_tail_points_beam(
     min_bin_frac=0.35,
     mean_weight=0.30,
     std_penalty=0.35,
+    transverse_recenter=False,
+    recenter_half_width=8.0,
+    recenter_along_sigma=2.0,
+    recenter_max_shift=3.0,
+    recenter_diagnostics=None,
 ):
     """
     Multi-hypothesis tail tracer using beam search and a robust segment score
     based on longitudinal continuity along each candidate tube.
+    Optional transverse recentering is applied only to committed new points;
+    manual seeds are retained exactly. Lookahead candidate scoring is unchanged.
     """
+    recenter_shifts = []
+    if recenter_diagnostics is not None:
+        recenter_diagnostics.update(n_attempted=0, n_shifted=0,
+                                    shift_rms_pix=0.0, shift_max_pix=0.0)
     if seed_points is not None:
         seed_points = np.asarray(seed_points, dtype=np.float64)
         if seed_points.ndim != 2 or seed_points.shape[1] != 2:
@@ -575,6 +657,18 @@ def trace_tail_points_beam(
             break
 
         nxt = np.array(best_future_pts[0], dtype=np.float64)
+        proposed = nxt.copy()
+        if transverse_recenter:
+            corrected = transverse_recenter_point(
+                I=I, usable=usable, point=nxt, direction=nxt - cur,
+                half_width=recenter_half_width, along_sigma=recenter_along_sigma,
+                max_shift=recenter_max_shift,
+            )
+            # Preserve the original forward-segment continuity requirement.
+            if (endpoint_in_component(corrected)
+                    and segment_mostly_in_component(cur, corrected,
+                                                   min_frac=0.85, n_samples=12)):
+                nxt = corrected
 
         dv = nxt - cur
         d = np.linalg.norm(dv)
@@ -587,7 +681,16 @@ def trace_tail_points_beam(
 
         pts.append((float(nxt[0]), float(nxt[1])))
         cur = nxt
+        if transverse_recenter:
+            recenter_shifts.append(float(np.linalg.norm(nxt - proposed)))
 
+    if recenter_diagnostics is not None and recenter_shifts:
+        shifts = np.asarray(recenter_shifts)
+        recenter_diagnostics.update(
+            n_attempted=int(shifts.size), n_shifted=int(np.count_nonzero(shifts > 1e-8)),
+            shift_rms_pix=float(np.sqrt(np.mean(shifts**2))),
+            shift_max_pix=float(np.max(shifts)),
+        )
     return np.asarray(pts, dtype=np.float64)
 
 
@@ -618,6 +721,60 @@ def fit_cubic_spline(points, smoothing=3.0, n_samples=400):
     xs, ys = splev(us, tck)
     spline = np.column_stack([xs, ys])
     return spline, tck
+
+
+def total_turning_angle(points, n_samples=500, smooth_sigma=2.0):
+    """Return total signed turning [rad] using the compare_splines.py estimator.
+
+    Resample in arc length, smooth coordinates with a reflect-padded Gaussian,
+    and integrate length-normalized signed curvature over fractional arc length.
+    Defaults match compare_splines.py and tail_length_mc_stats.py. Positive
+    turning is counterclockwise in x,y pixel coordinates; reversing the tracing
+    direction reverses the sign. This measures net signed turning, so bends of
+    opposite sign can cancel. No angular pixel-scale conversion is needed.
+    """
+    if n_samples < 5:
+        raise ValueError("turning n_samples must be >= 5")
+    if not np.isfinite(smooth_sigma) or smooth_sigma < 0:
+        raise ValueError("turning smooth_sigma must be finite and >= 0")
+    points = np.asarray(points, dtype=float)
+    if points.ndim != 2 or points.shape[1] != 2 or len(points) < 3:
+        raise ValueError("Turning calculation needs at least 3 x,y points")
+    if not np.all(np.isfinite(points)):
+        raise ValueError("Turning calculation requires finite x,y points")
+    keep = np.r_[True, np.linalg.norm(np.diff(points, axis=0), axis=1) > 0]
+    points = points[keep]
+    if len(points) < 3:
+        raise ValueError("Turning calculation needs at least 3 distinct consecutive points")
+    s = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))]
+    s_new = np.linspace(0.0, s[-1], n_samples)
+    points = np.column_stack([np.interp(s_new, s, points[:, j]) for j in (0, 1)])
+
+    if smooth_sigma > 0:
+        radius = max(1, int(np.ceil(4.0 * smooth_sigma)))
+        offsets = np.arange(-radius, radius + 1, dtype=float)
+        kernel = np.exp(-0.5 * (offsets / smooth_sigma) ** 2)
+        kernel /= kernel.sum()
+        points = np.column_stack([
+            np.convolve(np.pad(points[:, j], radius, mode="reflect"),
+                        kernel, mode="valid")
+            for j in (0, 1)
+        ])
+
+    s = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))]
+    if np.any(np.diff(s) <= 0):
+        raise ValueError("Degenerate curve after turning-coordinate smoothing")
+    dx = np.gradient(points[:, 0], s)
+    dy = np.gradient(points[:, 1], s)
+    ddx = np.gradient(dx, s)
+    ddy = np.gradient(dy, s)
+    kappa = (dx * ddy - dy * ddx) / np.maximum((dx**2 + dy**2)**1.5, 1e-14)
+    kappa_norm = kappa * s[-1]
+    increments = 0.5 * (kappa_norm[:-1] + kappa_norm[1:]) / (n_samples - 1)
+    angle = float(np.cumsum(increments)[-1])
+    if not np.isfinite(angle):
+        raise ValueError("Non-finite total turning angle")
+    return angle
 
 
 def save_points_csv(path, arr, header="x_pix,y_pix"):
@@ -672,14 +829,43 @@ def save_ds9_region_fk5(path, points_pix, wcs, color="green"):
 
 def append_summary_csv(path, row):
     """
-    Append one summary row to a CSV file.
-    Writes the header if the file does not already exist.
+    Append a summary, extending older CSV headers safely when new fields appear.
+    Existing rows retain their data, with blank values for newly added fields.
     """
     path = Path(path)
     write_header = (not path.exists()) or (path.stat().st_size == 0)
+    fieldnames = list(row.keys())
+
+    if not write_header:
+        with open(path, newline="") as f:
+            reader = csv.DictReader(f)
+            previous_fields = reader.fieldnames
+            if not previous_fields:
+                raise ValueError(f"Summary CSV has no header: {path}")
+            new_fields = [key for key in row if key not in previous_fields]
+            fieldnames = list(previous_fields) + new_fields
+            if new_fields:
+                previous_rows = list(reader)
+        if new_fields:
+            # Replace only after a complete new CSV has been written.
+            temp_path = None
+            try:
+                with NamedTemporaryFile(mode="w", newline="", dir=path.parent,
+                                        prefix=path.name + ".", suffix=".tmp",
+                                        delete=False) as f:
+                    temp_path = Path(f.name)
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(previous_rows)
+                    writer.writerow(row)
+                temp_path.replace(path)
+            finally:
+                if temp_path is not None and temp_path.exists():
+                    temp_path.unlink()
+            return
 
     with open(path, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         if write_header:
             writer.writeheader()
         writer.writerow(row)
@@ -812,6 +998,23 @@ def main():
         help="How strongly to update direction each step (0..1)",
     )
     p.add_argument(
+        "--transverse-recenter", "--transverse-recentering",
+        action="store_true",
+        help="Recenter committed new trace points on a local transverse brightness centroid",
+    )
+    p.add_argument(
+        "--recenter-half-width", type=float, default=8.0,
+        help="Transverse recentering window half-width in input-image pixels (default: 8)",
+    )
+    p.add_argument(
+        "--recenter-along-sigma", type=float, default=2.0,
+        help="Gaussian sigma along the tail for recentering, in input-image pixels (default: 2)",
+    )
+    p.add_argument(
+        "--recenter-max-shift", type=float, default=3.0,
+        help="Maximum perpendicular correction per new point in input-image pixels (default: 3)",
+    )
+    p.add_argument(
         "--min-weight-pixels",
         type=int,
         default=6,
@@ -866,6 +1069,14 @@ def main():
         help="Number of sampled points on the fitted spline",
     )
     p.add_argument(
+        "--turning-n-samples", type=int, default=500,
+        help="Arc-length samples for total turning (compare_splines.py default: 500)",
+    )
+    p.add_argument(
+        "--turning-smooth-sigma", type=float, default=2.0,
+        help="Gaussian coordinate smoothing for turning, in resampled points (default: 2)",
+    )
+    p.add_argument(
         "--beam-width",
         type=int,
         default=7,
@@ -905,8 +1116,7 @@ def main():
         "--out-prefix",
         type=str,
         default="tail_trace",
-        help="Output prefix for CSV/PNG/region products",
-    )
+        help="Output prefix for CSV/PNG/region products",    )
     p.add_argument(
         "--summary-csv",
         type=str,
@@ -914,6 +1124,16 @@ def main():
         help="Optional CSV file to append a one-line summary of the trace results",
     )
     args = p.parse_args()
+    if args.turning_n_samples < 5:
+        p.error("--turning-n-samples must be >= 5")
+    if not np.isfinite(args.turning_smooth_sigma) or args.turning_smooth_sigma < 0:
+        p.error("--turning-smooth-sigma must be finite and >= 0")
+    for option, value in [("--recenter-half-width", args.recenter_half_width),
+                          ("--recenter-along-sigma", args.recenter_along_sigma)]:
+        if not np.isfinite(value) or value <= 0:
+            p.error(f"{option} must be finite and > 0")
+    if not np.isfinite(args.recenter_max_shift) or args.recenter_max_shift < 0:
+        p.error("--recenter-max-shift must be finite and >= 0")
 
     mu, hdr = read_fits_2d(args.fits, args.hdu)
     wcs = get_wcs_from_header(hdr)
@@ -1046,6 +1266,7 @@ def main():
                 direction_radius=float(args.direction_radius),
             )
 
+    recenter_diagnostics = {}
     pts = trace_tail_points_beam(
         component=component,
         I=I_s,
@@ -1069,6 +1290,11 @@ def main():
         min_bin_frac=float(args.min_bin_frac),
         mean_weight=float(args.mean_weight),
         std_penalty=float(args.std_penalty),
+        transverse_recenter=args.transverse_recenter,
+        recenter_half_width=args.recenter_half_width,
+        recenter_along_sigma=args.recenter_along_sigma,
+        recenter_max_shift=args.recenter_max_shift,
+        recenter_diagnostics=recenter_diagnostics,
     )
 
     usable = component & np.isfinite(I) & (I > 0)
@@ -1183,6 +1409,18 @@ def main():
     seg = np.hypot(np.diff(spline[:, 0]), np.diff(spline[:, 1]))
     length_pix = float(np.sum(seg))
     length_arcmin = length_pix * 0.262 * 4 / 60.0
+    turning_status = "ok"
+    turning_error = ""
+    try:
+        total_turning_rad = total_turning_angle(
+            spline, args.turning_n_samples, args.turning_smooth_sigma
+        )
+    except ValueError as exc:
+        total_turning_rad = np.nan
+        turning_status = "failed"
+        turning_error = str(exc)
+        print(f"[Warn] Could not measure total turning angle: {exc}")
+    total_turning_deg = float(np.degrees(total_turning_rad))
     # This script does not currently estimate a length uncertainty.
     # Leave placeholders for later Monte Carlo / noise-realization errors.
     length_err_pix = np.nan
@@ -1237,6 +1475,20 @@ def main():
         "raw_fk5_reg": str(reg_raw_fk5) if wrote_fk5_reg else "",
         "spline_fk5_reg": str(reg_spline_fk5) if wrote_fk5_reg else "",
         "overlay_png": str(png_out),
+        "total_turning_rad": float(total_turning_rad),
+        "total_turning_deg": total_turning_deg,
+        "turning_n_samples": int(args.turning_n_samples),
+        "turning_smooth_sigma": float(args.turning_smooth_sigma),
+        "turning_status": turning_status,
+        "turning_error": turning_error,
+        "transverse_recenter": bool(args.transverse_recenter),
+        "recenter_half_width_pix": float(args.recenter_half_width),
+        "recenter_along_sigma_pix": float(args.recenter_along_sigma),
+        "recenter_max_shift_pix": float(args.recenter_max_shift),
+        "recenter_n_attempted": recenter_diagnostics["n_attempted"],
+        "recenter_n_shifted": recenter_diagnostics["n_shifted"],
+        "recenter_shift_rms_pix": recenter_diagnostics["shift_rms_pix"],
+        "recenter_shift_max_pix": recenter_diagnostics["shift_max_pix"],
     }
 
     if args.summary_csv is not None:
@@ -1246,9 +1498,20 @@ def main():
     print(f"Seed pixel used for component: ({x_seed}, {y_seed})")
     print(f"Start point: ({cx:.3f}, {cy:.3f})")
     print(f"Traced points: {pts.shape[0]}")
+    if args.transverse_recenter:
+        print("Transverse recentering: enabled")
+        print(f"  shifted points: {recenter_diagnostics['n_shifted']} / "
+              f"{recenter_diagnostics['n_attempted']} new points")
+        print(f"  correction RMS / maximum: "
+              f"{recenter_diagnostics['shift_rms_pix']:.3f} / "
+              f"{recenter_diagnostics['shift_max_pix']:.3f} pix")
     print(f"Spline samples: {spline.shape[0]}")
     print(f"Spline length: {length_pix:.3f} pix")
     print(f"Spline length: {length_arcmin:.3f} arcmin")
+    print(f"Total signed turning angle: {total_turning_rad:.6f} rad")
+    print(f"Total signed turning angle: {total_turning_deg:.6f} deg")
+    print(f"Turning calculation: {args.turning_n_samples} arc-length samples, "
+          f"coordinate smoothing sigma={args.turning_smooth_sigma:g} samples")
     print(f"Saved raw pixel CSV:      {raw_pix_csv}")
     print(f"Saved spline pixel CSV:   {spline_pix_csv}")
     if wrote_world:
