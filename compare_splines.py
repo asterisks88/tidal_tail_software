@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
+"""Compare spline geometry and export publication-sized residual figures.
+
+Example for CSV coordinates from 4x-binned Legacy images:
+    python compare_splines.py observed.csv model.csv \
+        --pixscale-arcsec 1.048 --plot tail_residuals.pdf
+
+A saved plot also produces matching PDF and PNG files. PDF curves and text
+remain vector graphics; PNG output defaults to 600 dpi. Residuals retain the
+original matched-fractional-arc-length definition, with spline A as reference.
+The single-column figure has a 5:8 aspect ratio, matching a 1000 x 1600 image.
+"""
 
 import argparse
 import csv
+from pathlib import Path
 
 import numpy as np
 from astropy import units as u
@@ -432,8 +444,86 @@ def print_report(
     print(f"max residual ({sep_unit})       : {np.max(sep_vals):.6g}")
 
 
-def maybe_plot(result, scale_info, outpath=None):
+def publication_plot_style():
+    """Local Matplotlib settings for readable journal-sized line figures."""
+    return {
+        "font.family": "serif",
+        "font.serif": ["STIXGeneral", "DejaVu Serif"],
+        "mathtext.fontset": "stix",
+        "font.size": 9.0,
+        "axes.labelsize": 10.0,
+        "axes.titlesize": 10.0,
+        "axes.linewidth": 0.8,
+        "axes.grid": False,
+        "axes.unicode_minus": True,
+        "xtick.labelsize": 8.5,
+        "ytick.labelsize": 8.5,
+        "xtick.direction": "in",
+        "ytick.direction": "in",
+        "xtick.top": True,
+        "ytick.right": True,
+        "xtick.major.size": 4.0,
+        "ytick.major.size": 4.0,
+        "xtick.minor.size": 2.2,
+        "ytick.minor.size": 2.2,
+        "xtick.major.width": 0.8,
+        "ytick.major.width": 0.8,
+        "xtick.minor.width": 0.6,
+        "ytick.minor.width": 0.6,
+        "xtick.major.pad": 3.0,
+        "ytick.major.pad": 3.0,
+        "lines.linewidth": 1.3,
+        "figure.facecolor": "white",
+        "figure.autolayout": False,
+        "figure.constrained_layout.use": False,
+        "axes.facecolor": "white",
+        "savefig.facecolor": "white",
+        "savefig.transparent": False,
+        "savefig.bbox": None,
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+        "svg.fonttype": "none",
+        "text.usetex": False,
+    }
+
+
+def save_publication_plot(fig, outpath, dpi=600):
+    """Save the requested format plus a vector PDF and high-resolution PNG."""
+    path = Path(outpath).expanduser()
+    suffix = path.suffix.lower()
+    supported = fig.canvas.get_supported_filetypes()
+    if suffix and suffix.lstrip(".") not in supported:
+        raise ValueError(
+            f"Unsupported plot extension {path.suffix!r}. "
+            "Use .pdf, .png, .svg, .eps, or another Matplotlib image format."
+        )
+
+    if suffix:
+        targets = [(path, suffix.lstrip("."))]
+        stem = path.with_suffix("")
+    else:
+        targets = []
+        stem = path
+
+    for fmt in ("pdf", "png"):
+        if not any(existing_fmt == fmt for _, existing_fmt in targets):
+            targets.append((Path(str(stem) + "." + fmt), fmt))
+
+    for target, fmt in targets:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Keep the chosen physical figure size; explicit margins below ensure
+        # labels fit without bbox_inches='tight' changing the export dimensions.
+        fig.savefig(target, format=fmt, dpi=dpi, bbox_inches=None)
+        print(f"Saved plot to: {target}")
+    return [target for target, _ in targets]
+
+
+def maybe_plot(
+    result, scale_info, outpath=None, *, plot_size="single", dpi=600,
+    show_stats=False, title=None,
+):
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import AutoMinorLocator, MaxNLocator
 
     residuals = result["residuals"]
 
@@ -447,47 +537,75 @@ def maybe_plot(result, scale_info, outpath=None):
         residuals["separation_pixels"], scale_info
     )
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
+    sizes = {"single": (3.5, 5.6), "double": (7.1, 4.8)}
+    if plot_size not in sizes:
+        raise ValueError("plot_size must be 'single' or 'double'")
+    if dpi < 300:
+        raise ValueError("Plot dpi must be at least 300")
 
-    ax1.plot(s_disp, cross_disp)
-    ax1.axhline(0.0, linewidth=1.0, linestyle="--")
-    ax1.set_ylabel(f"Cross-track offset [{y_unit}]")
-    ax1.set_title("Spline residuals at matched fractional arc length")
+    with plt.rc_context(publication_plot_style()):
+        fig, (ax1, ax2) = plt.subplots(
+            2, 1, figsize=sizes[plot_size], sharex=True,
+        )
+        fig.subplots_adjust(
+            left=0.21 if plot_size == "single" else 0.12,
+            right=0.97, bottom=0.12, top=0.92 if title else 0.97,
+            hspace=0.08,
+        )
 
-    ax2.plot(s_disp, sep_disp)
-    ax2.set_xlabel(f"Arc length along spline A [{s_unit}]")
-    ax2.set_ylabel(f"Residual offset [{y_unit}]")
+        # Colors are accompanied by different line styles and explicit labels.
+        ax1.plot(s_disp, cross_disp, color="#0072B2", linestyle="-", zorder=3)
+        ax1.axhline(0.0, color="0.4", linewidth=0.8, linestyle="--", zorder=1)
+        ax1.set_ylabel(r"$d_\perp$" + f" [{y_unit}]")
 
-    text = "\n".join(
-        [
-            f"direction_used = {result['direction_used']}",
-            f"shape similarity score = {result['shape_similarity_score']:.6f}",
-            (
-                f"cross-track RMSE [{y_unit}] = "
-                f"{rmse(cross_disp, np.zeros_like(cross_disp)):.6g}"
-            ),
-            f"mean residual [{y_unit}] = {np.mean(sep_disp):.6g}",
-            f"max residual [{y_unit}] = {np.max(sep_disp):.6g}",
-        ]
-    )
-    ax1.text(
-        0.99,
-        0.97,
-        text,
-        transform=ax1.transAxes,
-        ha="right",
-        va="top",
-        family="monospace",
-        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85},
-    )
+        ax2.plot(s_disp, sep_disp, color="#D55E00", linestyle="--", zorder=3)
+        ax2.set_xlabel(f"Arc length along spline A [{s_unit}]")
+        ax2.set_ylabel(r"$d_{\mathrm{2D}}$" + f" [{y_unit}]")
+        ax2.set_ylim(bottom=0.0)
+        ax2.set_xlim(float(s_disp[0]), float(s_disp[-1]))
 
-    plt.tight_layout()
+        for ax, label, description in (
+            (ax1, "(a)", "Cross-track offset"),
+            (ax2, "(b)", "Point separation"),
+        ):
+            ax.xaxis.set_major_locator(MaxNLocator(nbins=5, min_n_ticks=3))
+            ax.yaxis.set_major_locator(MaxNLocator(nbins=5, min_n_ticks=3))
+            ax.xaxis.set_minor_locator(AutoMinorLocator(2))
+            ax.yaxis.set_minor_locator(AutoMinorLocator(2))
+            ax.tick_params(which="both", direction="in", top=True, right=True)
+            ax.margins(y=0.12)
+            ax.text(
+                0.035, 0.95, label + "  " + description,
+                transform=ax.transAxes, ha="left", va="top", fontsize=8.5,
+                bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.9,
+                      "pad": 1.5},
+                zorder=4,
+            )
 
-    if outpath:
-        plt.savefig(outpath, dpi=200, bbox_inches="tight")
-        print(f"\nSaved plot to: {outpath}")
-    else:
-        plt.show()
+        if show_stats:
+            cross_rms = rmse(cross_disp, np.zeros_like(cross_disp))
+            ax1.text(
+                0.965, 0.08, f"RMS = {cross_rms:.3g} {y_unit}",
+                transform=ax1.transAxes, ha="right", va="bottom", fontsize=8,
+                bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.9,
+                      "pad": 1.5},
+            )
+            ax2.text(
+                0.965, 0.08, f"Median = {np.median(sep_disp):.3g} {y_unit}",
+                transform=ax2.transAxes, ha="right", va="bottom", fontsize=8,
+                bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.9,
+                      "pad": 1.5},
+            )
+        if title:
+            fig.suptitle(title, fontsize=10)
+
+        try:
+            if outpath:
+                return save_publication_plot(fig, outpath, dpi=dpi)
+            plt.show()
+            return []
+        finally:
+            plt.close(fig)
 
 
 def main():
@@ -527,9 +645,33 @@ def main():
         nargs="?",
         const="",
         default=None,
-        help="Show residual plot, or save to a file if a path is provided",
+        help=(
+            "Show the publication-style residual plot, or save to a path/prefix. "
+            "Saved plots include matching vector PDF and high-resolution PNG."
+        ),
+    )
+    parser.add_argument(
+        "--plot-size", choices=("single", "double"), default="single",
+        help=(
+            "Journal figure size: single column (3.5 x 5.6 in; 5:8 aspect "
+            "ratio) or double column (7.1 x 4.8 in)."
+        ),
+    )
+    parser.add_argument(
+        "--plot-dpi", type=int, default=600,
+        help="Resolution of raster plot exports (default: 600; minimum: 300).",
+    )
+    parser.add_argument(
+        "--plot-stats", action="store_true",
+        help="Add compact RMS and median annotations (default: omit them).",
+    )
+    parser.add_argument(
+        "--plot-title", default=None,
+        help="Optional figure title (default: no title; use the paper caption).",
     )
     args = parser.parse_args()
+    if args.plot_dpi < 300:
+        parser.error("--plot-dpi must be >= 300")
 
     raw_a = load_xy_csv(args.csv_a, x_col=args.x_col, y_col=args.y_col)
     raw_b = load_xy_csv(args.csv_b, x_col=args.x_col, y_col=args.y_col)
@@ -559,7 +701,11 @@ def main():
 
     if args.plot is not None:
         outpath = args.plot if args.plot != "" else None
-        maybe_plot(result, scale_info=scale_info, outpath=outpath)
+        maybe_plot(
+            result, scale_info=scale_info, outpath=outpath,
+            plot_size=args.plot_size, dpi=args.plot_dpi,
+            show_stats=args.plot_stats, title=args.plot_title,
+        )
 
 
 if __name__ == "__main__":
