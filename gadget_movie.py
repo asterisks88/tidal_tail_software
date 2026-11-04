@@ -57,6 +57,70 @@ type_map = {
 }
 
 
+def _snapshot_time_myr(h5f, time_unit_myr=None) -> float:
+    """Convert a noncomoving snapshot's Header/Time to physical Myr.
+
+    Prefer the run units in Parameters; also accept units stored in Header.
+    An explicit time_unit_myr supports older noncomoving snapshots without
+    unit metadata. Never interpret a cosmological scale factor as an age.
+    """
+    if "Header" not in h5f or "Time" not in h5f["Header"].attrs:
+        raise ValueError("Snapshot is missing Header/Time.")
+
+    t_code = float(np.asarray(h5f["Header"].attrs["Time"]).item())
+    if not math.isfinite(t_code):
+        raise ValueError("Snapshot Header/Time must be finite.")
+
+    attr_sources = [h5f[name].attrs for name in ("Parameters", "Header") if name in h5f]
+    noncomoving = False
+    for attrs in attr_sources:
+        if "ComovingIntegrationOn" not in attrs:
+            continue
+        flag = float(np.asarray(attrs["ComovingIntegrationOn"]).item())
+        if flag not in (0.0, 1.0):
+            raise ValueError("ComovingIntegrationOn must be 0 or 1.")
+        if flag == 1.0:
+            raise ValueError(
+                "ComovingIntegrationOn=1: Header/Time is a scale factor, not "
+                "elapsed time. This viewer's Myr labels require a noncomoving run."
+            )
+        noncomoving = True
+
+    if time_unit_myr is None:
+        if not noncomoving:
+            raise ValueError(
+                "Cannot determine the snapshot's integration mode. For a known "
+                "noncomoving run, supply --time-unit-myr explicitly."
+            )
+        for attrs in attr_sources:
+            if not all(
+                key in attrs
+                for key in ("UnitLength_in_cm", "UnitVelocity_in_cm_per_s")
+            ):
+                continue
+            unit_length = float(np.asarray(attrs["UnitLength_in_cm"]).item())
+            unit_velocity = float(np.asarray(attrs["UnitVelocity_in_cm_per_s"]).item())
+            if not all(math.isfinite(v) and v > 0 for v in (unit_length, unit_velocity)):
+                raise ValueError("Snapshot length and velocity units must be finite and positive.")
+            seconds_per_myr = 365.25 * 86400.0 * 1.0e6  # Julian-year definition
+            time_unit_myr = unit_length / unit_velocity / seconds_per_myr
+            break
+        else:
+            raise ValueError(
+                "Snapshot has no UnitLength_in_cm and UnitVelocity_in_cm_per_s "
+                "pair in Parameters or Header. Supply --time-unit-myr for this "
+                "noncomoving run; the time unit will not be guessed."
+            )
+
+    time_unit_myr = float(time_unit_myr)
+    if not math.isfinite(time_unit_myr) or time_unit_myr <= 0:
+        raise ValueError("The time unit in Myr must be finite and positive.")
+    result = t_code * time_unit_myr
+    if not math.isfinite(result):
+        raise ValueError("Converted snapshot time is not finite.")
+    return result
+
+
 # ----------------------------
 # Camera save/load (JSON)
 # ----------------------------
@@ -1555,6 +1619,7 @@ def gadget_hdf5_movie(
     tail_bbox=None,
     debug_photometry=False,
     synthetic_component="both",
+    time_unit_myr=None,
 ):
     global paused, running, update_frame, current_frame, start_frame, end_frame, frame_step
     frame_step = max(1, int(step_size))
@@ -1720,8 +1785,7 @@ def gadget_hdf5_movie(
     # Open the first frame to initialize datasets + galaxy ID ranges
     first_file = snap_format.format(start_frame)
     with h5py.File(first_file, "r") as f0:
-        t_code0 = f0["Header"].attrs.get("Time", 0.0)
-        time_myr0 = float(t_code0) * 1e3
+        time_myr0 = _snapshot_time_myr(f0, time_unit_myr=time_unit_myr)
 
         id_starts, id_ends, gal_names, gal_order = _get_galaxy_id_ranges(
             f0, galaxyid_map
@@ -2786,8 +2850,7 @@ def gadget_hdf5_movie(
         nonlocal text_actor
         frame_file = snap_format.format(frame_num)
         with h5py.File(frame_file, "r") as f:
-            t_code = f["Header"].attrs.get("Time", 0.0)
-            time_myr = float(t_code) * 1e3
+            time_myr = _snapshot_time_myr(f, time_unit_myr=time_unit_myr)
 
             for key in families:
                 idx, _, _ = type_map[key]
@@ -2883,6 +2946,16 @@ def main():
     parser.add_argument("end_frame", type=int, help="End frame (inclusive)")
     parser.add_argument("-b", "--start_frame", type=int, default=0, help="Start frame")
 
+    parser.add_argument(
+        "--time-unit-myr",
+        type=float,
+        default=None,
+        help=(
+            "Explicit Myr per internal time unit for noncomoving snapshots. "
+            "Default: derive from the snapshot's Parameters (or Header) unit "
+            "attributes. Use this override for older files without unit metadata."
+        ),
+    )
     parser.add_argument(
         "--point-size", type=float, default=1.0, help="Point glyph size"
     )
@@ -3199,6 +3272,7 @@ def main():
         tail_bbox=tail_bbox,
         debug_photometry=bool(args.debug_photometry),
         synthetic_component=args.synthetic_component,
+        time_unit_myr=args.time_unit_myr,
     )
 
 
