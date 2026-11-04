@@ -1,27 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Elliptical/S0 luminous mass & M200 from SDSS/DES g,r & z (Astropy)
+Elliptical/S0 stellar masses and Chabrier-based SHMR halo references (Astropy).
 
 Usage: mass_from_photometry.py galaxy.json galaxy_profile.magnitudes.json [options]
 The galaxy file supplies redshift and structural data; the second file is the
 combined g/r Sérsic-total magnitude JSON from legacy_ellipse_profile.py.
 
-Formatting rules:
-- Msun/Lsun fields: scientific notation strings with 3 significant figures.
-- Magnitudes & colors: 5 significant figures, fixed notation.
-- All other numbers: 3 significant figures, fixed notation.
+Formatted JSON keeps masses/luminosities to 3 significant figures and log10
+quantities to 6 significant figures. --json_numeric retains unrounded numbers.
 
-This version adds Monte Carlo uncertainty propagation for:
-  g,r,z -> K_g,K_r -> (g-r)_0 -> M_r -> L_r -> M/L_r -> M_star
+The selected --ml normalization sets the modeled stellar mass. SHMR inversion
+always uses its Chabrier-equivalent photometric mass (Bell diet Salpeter minus
+0.10 dex; Bernardi et al. 2010, equation 5). Progenitor luminosity adjustments
+and --target_ml_sigma affect the model, not the photometric SHMR reference.
 
-It reports:
-  - photometric_only uncertainties
-  - with_systematic uncertainties (optional M/L systematic floor)
+UniverseMachine DR1 returns historical peak Bryan--Norman virial masses,
+Mpeak, NOT M200c (Behroozi et al. 2019, Appendix J). An equivalent spherical
+NFW halo is converted to M200c, solving consistently for c200. This boundary
+conversion does not infer mass lost by a satellite. --halo_conversion_z can
+specify a known peak epoch; otherwise the observed redshift is an explicit
+reference-epoch assumption. The native Mpeak is retained in the output.
 
-Also fixes:
-  - bad halo_structure_from_M200(...) call in the Moster branch
-  - human-readable print block referencing missing icl_details
+Monte Carlo propagation includes g,r,z through the correlated color,
+K-corrections, luminosity, both IMF mass scales, SHMR inversion and conversion.
+Separate budgets report photometric errors, added M/L systematics, and an
+optional assumed halo scatter plus concentration scatter. These are inverted
+relation reference intervals, not a Bayesian P(Mhalo | photometry) posterior.
+Use --compare_log_m200 13.57 to check a modeled mass against each interval.
+
+Dependencies: numpy, astropy. UMACHINE_PATH supplies the DR1 parameter files.
 """
 
 import argparse
@@ -30,6 +38,7 @@ import copy
 import json
 import math
 import os
+from functools import lru_cache
 from typing import Any, List, Optional
 
 import astropy.units as u
@@ -74,6 +83,10 @@ def key_is_msun_or_lsun(key: Optional[str]) -> bool:
         return False
     kl = key.lower()
     return ("msun" in kl) or ("lsun" in kl) or ("l_sun" in kl)
+
+
+def key_is_logarithmic(key: Optional[str]) -> bool:
+    return key is not None and ("log10" in key.lower() or key.lower().endswith("_dex"))
 
 
 _MAG_KEYS_EXPLICIT = {
@@ -125,7 +138,8 @@ def _effective_format_key(
     """
     if leaf_key is not None:
         if (
-            key_is_msun_or_lsun(leaf_key)
+            key_is_logarithmic(leaf_key)
+            or key_is_msun_or_lsun(leaf_key)
             or key_is_magnitude_like(leaf_key)
             or key_is_position_like(leaf_key)
         ):
@@ -145,7 +159,9 @@ def format_numbers_inplace(obj: Any, context_key: Optional[str] = None):
             else:
                 if isinstance(v, (int, float, np.floating)) and not isinstance(v, bool):
                     use_key = _effective_format_key(k, context_key)
-                    if key_is_msun_or_lsun(use_key):
+                    if key_is_logarithmic(use_key):
+                        obj[k] = f"{float(v):.6g}"
+                    elif key_is_msun_or_lsun(use_key):
                         obj[k] = sci3(v)
                     elif key_is_position_like(use_key):
                         obj[k] = str(v)
@@ -160,7 +176,9 @@ def format_numbers_inplace(obj: Any, context_key: Optional[str] = None):
             else:
                 if isinstance(v, (int, float, np.floating)) and not isinstance(v, bool):
                     use_key = context_key
-                    if key_is_msun_or_lsun(use_key):
+                    if key_is_logarithmic(use_key):
+                        obj[i] = f"{float(v):.6g}"
+                    elif key_is_msun_or_lsun(use_key):
                         obj[i] = sci3(v)
                     elif key_is_position_like(use_key):
                         obj[i] = str(v)
@@ -168,6 +186,19 @@ def format_numbers_inplace(obj: Any, context_key: Optional[str] = None):
                         obj[i] = mag5_noexp_str(v)
                     else:
                         obj[i] = sig3_noexp_str(v)
+
+
+def finite_json_values(obj):
+    """Represent absent/undefined quantities as null, never nonstandard JSON NaN."""
+    if isinstance(obj, dict):
+        return {key: finite_json_values(value) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [finite_json_values(value) for value in obj]
+    if isinstance(obj, (float, np.floating)):
+        return float(obj) if np.isfinite(obj) else None
+    if isinstance(obj, np.integer):
+        return int(obj)
+    return obj
 
 
 # ------------------ Chilingarian/Saulder K-corrections ------------------
@@ -247,8 +278,7 @@ def compute_restframe_quantities(
       g,r,z -> K_g,K_r -> (g-r)_0
       M_r -> L_r -> M/L_r -> M_star
 
-    If M_r_input is supplied, it is used directly for the luminosity.
-    Otherwise M_r is computed from r, K_r, and the distance modulus.
+    M_r is computed from r, K_r, and the distance modulus.
     """
     g = np.asarray(g, dtype=float)
     r = np.asarray(r, dtype=float)
@@ -296,11 +326,13 @@ def summarize_samples(samples, positive_only: bool = False) -> Optional[dict]:
     if x.size == 0:
         return None
 
-    p16, p50, p84 = np.percentile(x, [16, 50, 84])
+    p025, p16, p50, p84, p975 = np.percentile(x, [2.5, 16, 50, 84, 97.5])
     out = {
+        "p2_5": float(p025),
         "p16": float(p16),
         "median": float(p50),
         "p84": float(p84),
+        "p97_5": float(p975),
         "err_minus": float(p50 - p16),
         "err_plus": float(p84 - p50),
         "std": float(np.std(x, ddof=1)) if x.size > 1 else 0.0,
@@ -309,7 +341,19 @@ def summarize_samples(samples, positive_only: bool = False) -> Optional[dict]:
 
     if positive_only:
         lx = np.log10(x)
+        l025, l16, l50, l84, l975 = np.percentile(lx, [2.5, 16, 50, 84, 97.5])
         out["sigma_dex"] = float(np.std(lx, ddof=1)) if x.size > 1 else 0.0
+        out.update(
+            {
+                "log10_p2_5": float(l025),
+                "log10_p16": float(l16),
+                "log10_median": float(l50),
+                "log10_p84": float(l84),
+                "log10_p97_5": float(l975),
+                "log10_err_minus": float(l50 - l16),
+                "log10_err_plus": float(l84 - l50),
+            }
+        )
 
     return out
 
@@ -327,6 +371,13 @@ def estimate_photometric_uncertainties_mc(
     nsamp: int = 5000,
     systematic_dex: float = 0.0,
     seed: Optional[int] = None,
+    gr_correlation: float = 0.0,
+    photometric_mass_scale: float = 1.0,
+    model_bulge_scale: float = 1.0,
+    model_disk_scale: float = 0.0,
+    model_ml_scale: float = 1.0,
+    chabrier_offset_dex: float = 0.0,
+    return_samples: bool = False,
 ) -> dict:
     """
     Propagate g,r,z uncertainties through:
@@ -343,12 +394,18 @@ def estimate_photometric_uncertainties_mc(
     r_err = 0.0 if r_err is None else max(0.0, float(r_err))
     z_err = 0.0 if z_err is None else max(0.0, float(z_err))
 
-    gs = rng.normal(g, g_err, nsamp) if g_err > 0 else np.full(nsamp, g, dtype=float)
-    rs = rng.normal(r, r_err, nsamp) if r_err > 0 else np.full(nsamp, r, dtype=float)
+    # The same draws feed color and luminosity; their covariance is retained.
+    if not np.isfinite(gr_correlation) or abs(gr_correlation) > 1:
+        raise ValueError("g/r error correlation must lie in [-1, 1].")
+    ng, nr = rng.normal(size=(2, nsamp))
+    gs = g + g_err * ng
+    rs = r + r_err * (gr_correlation * ng + np.sqrt(1 - gr_correlation**2) * nr)
     zs = rng.normal(z, z_err, nsamp) if z_err > 0 else np.full(nsamp, z, dtype=float)
 
-    # Avoid z <= 0 causing pathological distance moduli
-    zs = np.clip(zs, 1.0e-8, None)
+    # Truncated normal, rather than clipping negative draws to an artificial peak.
+    while np.any(zs <= 0):
+        bad = zs <= 0
+        zs[bad] = rng.normal(z, z_err, int(np.sum(bad)))
     base = compute_restframe_quantities(
         gs,
         rs,
@@ -358,16 +415,32 @@ def estimate_photometric_uncertainties_mc(
         cosmo,
     )
 
-    phot = {
-        "g_minus_r_0": summarize_samples(base["gmr0"], positive_only=False),
-        "M_r_mag": summarize_samples(base["M_r"], positive_only=False),
-        "L_r_Lsun": summarize_samples(base["Lr_Lsun"], positive_only=True),
-        "M_over_L_r": summarize_samples(base["ML"], positive_only=True),
-        "M_star_Msun": summarize_samples(base["Mstar"], positive_only=True),
-        "M_star_Msun_with_missing": summarize_samples(
-            base["Mstar"], positive_only=True
-        ),
-    }
+    def budget(sys_factor):
+        model_base = base["Mstar"] * sys_factor * model_ml_scale
+        model_total = model_base * (model_bulge_scale + model_disk_scale)
+        phot_total = base["Mstar"] * sys_factor * photometric_mass_scale
+        chabrier = phot_total * 10.0 ** (-chabrier_offset_dex)
+        summary = {
+            "g_minus_r_0": summarize_samples(base["gmr0"]),
+            "M_r_mag": summarize_samples(base["M_r"]),
+            "L_r_Lsun": summarize_samples(base["Lr_Lsun"], positive_only=True),
+            "M_over_L_r": summarize_samples(
+                base["ML"] * sys_factor * model_ml_scale, True
+            ),
+            "M_star_Msun": summarize_samples(model_total, True),
+            "M_star_Msun_with_missing": summarize_samples(model_total, True),
+            "M_bulge_Msun": summarize_samples(
+                model_base * model_bulge_scale, positive_only=model_bulge_scale > 0
+            ),
+            "M_disk_Msun": summarize_samples(
+                model_base * model_disk_scale, positive_only=model_disk_scale > 0
+            ),
+            "M_star_photometric_Msun": summarize_samples(phot_total, True),
+            "M_star_Chabrier_for_SHMR_Msun": summarize_samples(chabrier, True),
+        }
+        return summary, chabrier
+
+    phot, chabrier_phot = budget(np.ones(nsamp))
 
     out = {
         "method": "monte_carlo",
@@ -378,24 +451,25 @@ def estimate_photometric_uncertainties_mc(
             "systematic_dex": float(systematic_dex),
             "nsamp": nsamp,
             "seed": seed,
+            "g_r_error_correlation": gr_correlation,
+            "photometric_mass_scale": photometric_mass_scale,
+            "model_bulge_scale": model_bulge_scale,
+            "model_disk_scale": model_disk_scale,
+            "model_ml_scale": model_ml_scale,
+            "diet_to_chabrier_offset_dex": chabrier_offset_dex,
         },
         "photometric_only": phot,
     }
 
+    sys_factor = 10.0 ** rng.normal(0.0, systematic_dex, nsamp)
+    with_sys, chabrier_sys = budget(sys_factor)
     if systematic_dex > 0:
-        sys_factor = 10.0 ** rng.normal(0.0, systematic_dex, nsamp)
-        ML_sys = base["ML"] * sys_factor
-        Mstar_sys = ML_sys * base["Lr_Lsun"]
-
-        out["with_systematic"] = {
-            "g_minus_r_0": summarize_samples(base["gmr0"], positive_only=False),
-            "M_r_mag": summarize_samples(base["M_r"], positive_only=False),
-            "L_r_Lsun": summarize_samples(base["Lr_Lsun"], positive_only=True),
-            "M_over_L_r": summarize_samples(ML_sys, positive_only=True),
-            "M_star_Msun": summarize_samples(Mstar_sys, positive_only=True),
-            "M_star_Msun_with_missing": summarize_samples(
-                Mstar_sys, positive_only=True
-            ),
+        out["with_systematic"] = with_sys
+    if return_samples:
+        out["_samples"] = {
+            "z": zs,
+            "Mstar_chabrier_photometric": chabrier_phot,
+            "Mstar_chabrier_with_systematic": chabrier_sys,
         }
 
     return out
@@ -416,79 +490,141 @@ def mstar_from_mhalo_moster13(
 def invert_shmr_moster13(Mstar: float) -> float:
     p = moster2013_params_z0()
     N, M1, beta, gamma = p["N"], 10.0 ** p["log10M1"], p["beta"], p["gamma"]
-    lo, hi = 10.0, 16.0
+    stars = np.asarray(Mstar, dtype=float)
+    if np.any(~np.isfinite(stars) | (stars <= 0)):
+        raise ValueError("Moster inversion requires positive finite stellar masses.")
+    lo, hi = np.full(stars.shape, 8.0), np.full(stars.shape, 18.0)
+    if np.any(
+        (stars < mstar_from_mhalo_moster13(10.0**lo, N, M1, beta, gamma))
+        | (stars > mstar_from_mhalo_moster13(10.0**hi, N, M1, beta, gamma))
+    ):
+        raise ValueError("Stellar mass exceeds the Moster inversion bracket.")
     for _ in range(80):
         mid = 0.5 * (lo + hi)
         Mh = 10.0**mid
-        if mstar_from_mhalo_moster13(Mh, N, M1, beta, gamma) < Mstar:
-            lo = mid
-        else:
-            hi = mid
-    return 10.0 ** (0.5 * (lo + hi))
+        below = mstar_from_mhalo_moster13(Mh, N, M1, beta, gamma) < stars
+        lo, hi = np.where(below, mid, lo), np.where(below, hi, mid)
+    result = 10.0 ** (0.5 * (lo + hi))
+    return float(result) if result.ndim == 0 else result
 
 
-# Load data from Figure 9, 10 in Behroozi P., Wechsler R. H., Hearin A. P., Conroy C., 2019, MNRAS, 488, 289
-def load_umachine_smhm(z: float, galaxy_type: str) -> list[list]:
-    umachine_smhm = []
-    upath_str = os.environ.get(
-        "UMACHINE_PATH", os.path.join(os.environ.get("HOME", ""), "umachine-dr1")
-    )
-    param_files = {
-        "all": os.path.join(upath_str, "data/smhm/params/smhm_med_params.txt"),
-        "host": os.path.join(upath_str, "data/smhm/params/smhm_med_cen_params.txt"),
-        "sat": os.path.join(upath_str, "data/smhm/params/smhm_med_sat_params.txt"),
-    }
+# Behroozi et al. 2019, MNRAS, 488, 3143, Appendix J, equations J1--J8.
+# The abscissa is historical peak Mvir in Msun, not M200c or Msun/h.
+UM_PARAMETER_NAMES = (
+    "EFF_0 EFF_0_A EFF_0_A2 EFF_0_Z M_1 M_1_A M_1_A2 M_1_Z "
+    "ALPHA ALPHA_A ALPHA_A2 ALPHA_Z BETA BETA_A BETA_Z DELTA "
+    "GAMMA GAMMA_A GAMMA_Z CHI2"
+).split()
+UM_COSMOLOGY = FlatLambdaCDM(H0=67.8, Om0=0.307)
+MOSTER_COSMOLOGY = FlatLambdaCDM(H0=70.4, Om0=0.272)
 
-    with open(param_files[galaxy_type], "r") as param_file:
-        param_list = []
-        for line in param_file:
-            param_list.append(float((line.split(" "))[1]))
 
-    names = "EFF_0 EFF_0_A EFF_0_A2 EFF_0_Z M_1 M_1_A M_1_A2 M_1_Z ALPHA ALPHA_A ALPHA_A2 ALPHA_Z BETA BETA_A BETA_Z DELTA GAMMA GAMMA_A GAMMA_Z CHI2".split(
-        " "
-    )
-    params = dict(zip(names, param_list))
+def um_parameter_path(galaxy_type: str, root: Optional[str] = None) -> str:
+    root = root or os.environ.get("UMACHINE_PATH", os.path.expanduser("~/umachine-dr1"))
+    filename = {
+        "all": "smhm_med_params.txt",
+        "host": "smhm_med_cen_params.txt",
+        "sat": "smhm_med_sat_params.txt",
+    }[galaxy_type]
+    return os.path.join(os.path.expanduser(root), "data", "smhm", "params", filename)
+
+
+@lru_cache(maxsize=8)
+def read_um_parameters(path: str) -> dict:
+    """Read the 19 fit coefficients and an optional trailing CHI2 diagnostic.
+
+    Accept named or legacy positional files. Missing named fit coefficients
+    are errors: an omitted coefficient must never shift subsequent values.
+    CHI2 is not used in evaluating or inverting the stellar--halo relation.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            rows = [line.split("#", 1)[0].split() for line in handle]
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"UniverseMachine parameter file not found: {path}. Set UMACHINE_PATH "
+            "or --umachine_path to the DR1 root containing data/smhm/params/."
+        ) from exc
+    rows = [row for row in rows if row]
+    required_names = UM_PARAMETER_NAMES[:-1]  # CHI2 is an optional diagnostic.
+    if len(rows) not in (len(required_names), len(UM_PARAMETER_NAMES)):
+        raise ValueError(
+            f"Expected 19 UniverseMachine fit-coefficient rows, optionally followed "
+            f"by CHI2 (20 rows), in {path}; got {len(rows)}."
+        )
+    labels = [row[0].upper().rstrip(":=") if len(row) >= 2 else None for row in rows]
+    values = []
+    for index, row in enumerate(rows, start=1):
+        token = row[1] if len(row) >= 2 else row[0]
+        try:
+            values.append(float(token.replace("D", "E").replace("d", "e")))
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid numeric value in UniverseMachine data row {index} of {path}: {token!r}"
+            ) from exc
+    if any(label in UM_PARAMETER_NAMES for label in labels):
+        named = {}
+        for label, value in zip(labels, values):
+            if label in named:
+                raise ValueError(
+                    f"Duplicate UniverseMachine parameter {label!r} in {path}."
+                )
+            named[label] = value
+        missing = [name for name in required_names if name not in named]
+        if missing:
+            raise ValueError(
+                f"Missing required UniverseMachine coefficients in {path}: {', '.join(missing)}. Only CHI2 is optional."
+            )
+        params = {name: named[name] for name in UM_PARAMETER_NAMES if name in named}
+    else:
+        # Preserve compatibility with the positional labels used by DR1 files.
+        params = dict(zip(UM_PARAMETER_NAMES, values))
+    if (
+        not all(np.isfinite(params[name]) for name in required_names)
+        or params["DELTA"] <= 0
+    ):
+        raise ValueError(f"Invalid UniverseMachine parameters in {path}.")
+    return params
+
+
+def um_log_mstar(log_mpeak, z, params: dict):
+    """Vectorized median log10 Chabrier stellar mass at historical log10 Mpeak."""
+    z = np.asarray(z, dtype=float)
     a = 1.0 / (1.0 + z)
-    a1 = a - 1.0
-    lna = math.log(a)
-    zparams = {}
-    zparams["m_1"] = (
+    a1, lna = a - 1.0, np.log(a)
+    m1 = (
         params["M_1"]
         + a1 * params["M_1_A"]
         - lna * params["M_1_A2"]
         + z * params["M_1_Z"]
     )
-    zparams["sm_0"] = (
-        zparams["m_1"]
-        + params["EFF_0"]
+    epsilon = (
+        params["EFF_0"]
         + a1 * params["EFF_0_A"]
         - lna * params["EFF_0_A2"]
         + z * params["EFF_0_Z"]
     )
-    zparams["alpha"] = (
+    alpha = (
         params["ALPHA"]
         + a1 * params["ALPHA_A"]
         - lna * params["ALPHA_A2"]
         + z * params["ALPHA_Z"]
     )
-    zparams["beta"] = params["BETA"] + a1 * params["BETA_A"] + z * params["BETA_Z"]
-    zparams["delta"] = params["DELTA"]
-    zparams["gamma"] = 10 ** (
-        params["GAMMA"] + a1 * params["GAMMA_A"] + z * params["GAMMA_Z"]
-    )
+    beta = params["BETA"] + a1 * params["BETA_A"] + z * params["BETA_Z"]
+    gamma = 10.0 ** (params["GAMMA"] + a1 * params["GAMMA_A"] + z * params["GAMMA_Z"])
+    dm = np.asarray(log_mpeak, dtype=float) - m1
+    log_sum = np.logaddexp(
+        -alpha * dm * np.log(10.0), -beta * dm * np.log(10.0)
+    ) / np.log(10.0)
+    return m1 + epsilon - log_sum + gamma * np.exp(-0.5 * (dm / params["DELTA"]) ** 2)
 
-    smhm_max = 14.5 - 0.35 * z
-    for m in [x * 0.05 for x in range(int(10.5 * 20), int(smhm_max * 20 + 1), 1)]:
-        dm = m - zparams["m_1"]
-        dm2 = dm / zparams["delta"]
-        sm = (
-            zparams["sm_0"]
-            - math.log10(10 ** (-zparams["alpha"] * dm) + 10 ** (-zparams["beta"] * dm))
-            + zparams["gamma"] * math.exp(-0.5 * (dm2 * dm2))
-        )
-        umachine_smhm.append([sm, m, sm - m])
 
-    return umachine_smhm
+def load_umachine_smhm(z: float, galaxy_type: str) -> list[list]:
+    """Compatibility table: [log Mstar, log Mpeak, log(Mstar/Mpeak)]."""
+    params = read_um_parameters(um_parameter_path(galaxy_type))
+    mh = np.arange(10.5, 14.5 - 0.35 * z + 0.025, 0.05)
+    sm = um_log_mstar(mh, z, params)
+    return np.column_stack((sm, mh, sm - mh)).tolist()
 
 
 def _interp_loglog(x, xy):
@@ -504,9 +640,48 @@ def _interp_loglog(x, xy):
     return 10 ** (np.interp(lx, xs, ys))
 
 
-def m200_um_median(Mstar: float, z: float, galaxy_type: str) -> float:
-    umachine_smhm = load_umachine_smhm(z, galaxy_type)
-    return _interp_loglog(Mstar, umachine_smhm)
+def mpeak_um_median(Mstar, z, galaxy_type: str, params: Optional[dict] = None):
+    """Invert the forward median relation; this is not a conditional posterior."""
+    if params is None:
+        params = read_um_parameters(um_parameter_path(galaxy_type))
+    mass, redshift = np.broadcast_arrays(np.asarray(Mstar, float), np.asarray(z, float))
+    if np.any(
+        ~np.isfinite(mass) | (mass <= 0) | ~np.isfinite(redshift) | (redshift < 0)
+    ):
+        raise ValueError(
+            "UM inversion requires positive finite stellar masses and z >= 0."
+        )
+    target = np.log10(mass)
+    lo, hi = np.full(mass.shape, 8.0), np.full(mass.shape, 18.0)
+    if np.any(
+        (target < um_log_mstar(lo, redshift, params))
+        | (target > um_log_mstar(hi, redshift, params))
+    ):
+        raise ValueError(
+            "Stellar-mass draws exceed the UM inversion bracket (10^8--10^18 Msun)."
+        )
+    for _ in range(60):
+        mid = (lo + hi) / 2.0
+        below = um_log_mstar(mid, redshift, params) < target
+        lo, hi = np.where(below, mid, lo), np.where(below, hi, mid)
+    result = 10.0 ** ((lo + hi) / 2.0)
+    return float(result) if result.ndim == 0 else result
+
+
+def m200_um_median(
+    Mstar: float,
+    z: float,
+    galaxy_type: str,
+    cosmo=Planck18,
+    c_input: Optional[float] = None,
+) -> float:
+    """M200c equivalent of Mpeak, assuming the halo is evaluated at redshift z.
+
+    Mstar MUST already be on the Chabrier scale. No stripping correction is made.
+    """
+    native = mpeak_um_median(Mstar, z, galaxy_type)
+    converted, _ = virial_to_m200c_nfw(native, z, cosmo, c_input)
+    return float(converted)
 
 
 # ------------------ (R200, M200) helpers ------------------
@@ -528,8 +703,99 @@ def c200_from_m200_dutton2014(M200: float, h: float) -> float:
 
 
 def c200_from_m200_wang2022(M200: float, h: float) -> float:
-    # log10 c200 = a + b * log10( M200 / (h^-1 Msun) )
-    return 10.0 ** (2.161 + -0.105 * math.log10(M200 * h))
+    # Retained legacy function name. Gu et al. 2022, RAA 22, 125015, equation 5:
+    # log10 c200 = 2.161 - 0.105 log10(M200 / (h^-1 Msun)), z~0.
+    return 10.0 ** (2.161 - 0.105 * np.log10(np.asarray(M200) * h))
+
+
+def bryan_norman_delta_critical(z, cosmo):
+    """Flat-LambdaCDM virial overdensity relative to critical density (BN98 eq. 6)."""
+    x = np.asarray(cosmo.Om(z)) - 1.0
+    return 18.0 * np.pi**2 + 82.0 * x - 39.0 * x**2
+
+
+def nfw_f(c):
+    c = np.asarray(c, dtype=float)
+    return np.log1p(c) - c / (1.0 + c)
+
+
+def virial_to_m200c_nfw(
+    Mvir,
+    z,
+    cosmo,
+    c_input=None,
+    concentration_factor=1.0,
+    source_cosmo=UM_COSMOLOGY,
+    source_delta=None,
+):
+    """Preserve one spherical NFW density profile while changing its boundary.
+
+    Source Mvir uses BN98 in the native SHMR cosmology; target M200c uses
+    the user's cosmology. c_input is c200c, NOT cvir. Otherwise the retained
+    z~0 concentration--mass law is evaluated self-consistently at target M200c.
+    No historical-to-current mass evolution or tidal stripping is inferred.
+    """
+    mass, redshift, factor = np.broadcast_arrays(
+        np.asarray(Mvir, float),
+        np.asarray(z, float),
+        np.asarray(concentration_factor, float),
+    )
+    if np.any(
+        ~np.isfinite(mass)
+        | (mass <= 0)
+        | ~np.isfinite(redshift)
+        | (redshift < 0)
+        | ~np.isfinite(factor)
+        | (factor <= 0)
+    ):
+        raise ValueError(
+            "NFW conversion needs finite positive masses/factors and z >= 0."
+        )
+    if c_input is not None and (not np.isfinite(c_input) or c_input <= 0):
+        raise ValueError("c200 override must be finite and positive.")
+    rho_source = source_cosmo.critical_density(redshift).to_value(u.Msun / u.kpc**3)
+    rho_target = cosmo.critical_density(redshift).to_value(u.Msun / u.kpc**3)
+    delta_source = (
+        bryan_norman_delta_critical(redshift, source_cosmo)
+        if source_delta is None
+        else np.full_like(redshift, source_delta)
+    )
+    delta_target = delta_source * rho_source / rho_target
+    if np.any(delta_target <= 0):
+        raise ValueError("Nonpositive virial density threshold.")
+    log_native = np.log10(mass)
+    lo, hi = log_native - 3.0, log_native + 3.0
+    h = cosmo.H0.value / 100.0
+    for _ in range(60):
+        mid = (lo + hi) / 2.0
+        trial = 10.0**mid
+        c200 = (
+            c200_from_m200_wang2022(trial, h) if c_input is None else c_input
+        ) * factor
+        cvir = c200 * (200.0 * mass / (delta_target * trial)) ** (1.0 / 3.0)
+        predicted_log_vir = mid + np.log10(nfw_f(cvir) / nfw_f(c200))
+        below = predicted_log_vir < log_native
+        lo, hi = np.where(below, mid, lo), np.where(below, hi, mid)
+    result = 10.0 ** ((lo + hi) / 2.0)
+    c200 = (c200_from_m200_wang2022(result, h) if c_input is None else c_input) * factor
+    cvir = c200 * (200.0 * mass / (delta_target * result)) ** (1.0 / 3.0)
+    r200 = (3.0 * result / (4.0 * np.pi * 200.0 * rho_target)) ** (1.0 / 3.0)
+    rvir = (3.0 * mass / (4.0 * np.pi * delta_source * rho_source)) ** (1.0 / 3.0)
+    metadata = {
+        "Delta_vir_critical_native": delta_source,
+        "virial_density_over_target_critical": delta_target,
+        "M200c_over_Mvir": result / mass,
+        "c200": c200,
+        "cvir": cvir,
+        "R200_kpc": r200,
+        "Rvir_kpc": rvir,
+        "r_s_kpc": r200 / c200,
+    }
+    metadata = {
+        key: float(value) if np.ndim(value) == 0 else value
+        for key, value in metadata.items()
+    }
+    return (float(result) if result.ndim == 0 else result), metadata
 
 
 # ------------------ ICL prior ------------------
@@ -577,6 +843,128 @@ def halo_structure_from_M200(
         "c_used": c_used,
         "r_s_kpc": rs.to_value(u.kpc),
         "a_halo_kpc": a_halo.to_value(u.kpc),
+    }
+
+
+def estimate_halo_reference_mc(
+    samples: dict,
+    cosmo,
+    galaxy_type: str,
+    c_input=None,
+    params=None,
+    shmr_model: str = "umachine",
+    icl_fraction: float = 0.0,
+    halo_scatter_dex: float = 0.25,
+    c_scatter_dex: float = 0.10,
+    native_shift_dex: float = 0.0,
+    conversion_z=None,
+    seed: int = 12346,
+    model_mass_per_chabrier_mass: float = 1.0,
+) -> dict:
+    """Propagate shared draws all the way to native and M200c reference masses.
+
+    Halo scatter is an explicitly assumed lognormal prior at fixed stellar
+    mass, applied to native halo mass. It is not UM's scatter in Mstar at fixed
+    Mpeak and does not implement a Bayesian inversion or a halo mass function.
+    """
+    zs = samples["z"]
+    zconvert = zs if conversion_z is None else np.full_like(zs, conversion_z)
+    rng = np.random.default_rng(seed)
+    source_cosmo = UM_COSMOLOGY if shmr_model == "umachine" else MOSTER_COSMOLOGY
+    native = []
+    for key in ("Mstar_chabrier_photometric", "Mstar_chabrier_with_systematic"):
+        stars = samples[key] * (1.0 + icl_fraction)
+        mass = (
+            mpeak_um_median(stars, zs, galaxy_type, params)
+            if shmr_model == "umachine"
+            else invert_shmr_moster13(stars)
+        )
+        native.append(mass * 10.0**native_shift_dex)
+    c_factor = 10.0 ** rng.normal(0.0, c_scatter_dex, len(zs))
+    halo_factor = 10.0 ** rng.normal(0.0, halo_scatter_dex, len(zs))
+    stage_specs = [
+        ("photometric_only", native[0], 1.0, "Mstar_chabrier_photometric"),
+        ("with_ml_systematic", native[1], 1.0, "Mstar_chabrier_with_systematic"),
+        (
+            "with_ml_systematic_and_concentration",
+            native[1],
+            c_factor,
+            "Mstar_chabrier_with_systematic",
+        ),
+        (
+            "with_ml_systematic_and_concentration_and_halo_scatter",
+            native[1] * halo_factor,
+            c_factor,
+            "Mstar_chabrier_with_systematic",
+        ),
+    ]
+    budgets, mass_draws = {}, {}
+    for name, native_draws, concentration_factor, stellar_key in stage_specs:
+        m200, converted = virial_to_m200c_nfw(
+            native_draws,
+            zconvert,
+            cosmo,
+            c_input,
+            concentration_factor=concentration_factor,
+            source_cosmo=(source_cosmo if shmr_model == "umachine" else cosmo),
+            source_delta=(None if shmr_model == "umachine" else 200.0),
+        )
+        r200 = converted["R200_kpc"]
+        v200 = (10.0 * cosmo.H(zconvert) * r200 * u.kpc).to_value(u.km / u.s)
+        model_stars = samples[stellar_key] * model_mass_per_chabrier_mass
+        budgets[name] = {
+            "native_halo_mass_Msun": summarize_samples(native_draws, True),
+            "M200c_Msun": summarize_samples(m200, True),
+            "V200_kms": summarize_samples(v200, True),
+            "R200_kpc": summarize_samples(r200, True),
+            "c200": summarize_samples(converted["c200"], True),
+            "Mstar_model_over_M200c": summarize_samples(model_stars / m200, True),
+        }
+        mass_draws[name] = m200
+    base_logs = np.log10(np.concatenate(native)) - native_shift_dex
+    outside_fit = (
+        float(np.mean((base_logs < 10.5) | (base_logs > 15.0)))
+        if shmr_model == "umachine"
+        else None
+    )
+    return {
+        "method": "shared_draw_monte_carlo_inversion_of_forward_median_relation",
+        "interpretation": "Reference intervals, not a Bayesian conditional halo-mass posterior.",
+        "assumed_halo_scatter_dex_at_fixed_stellar_mass": halo_scatter_dex,
+        "concentration_scatter_dex": c_scatter_dex,
+        "uncertainties_not_included": [
+            "UM fit-parameter covariance and cosmological abundance recalibration",
+            "Unspecified photometric systematics, D/T and progenitor adjustment errors",
+            "IMF-conversion uncertainty, halo profile/shape uncertainty and satellite stripping",
+        ],
+        "stellar_driven_fraction_outside_log10_native_mass_10_5_to_15": outside_fit,
+        "budgets": budgets,
+        "_mass_draws": mass_draws,
+    }
+
+
+def compare_model_mass(log_mass: float, mass_draws: dict) -> dict:
+    """Report interval membership without changing or fitting the uncertainty budget."""
+    model_mass = 10.0**log_mass
+    intervals = {}
+    for name, draws in mass_draws.items():
+        summary = summarize_samples(draws, True)
+        percentile = 100.0 * (
+            np.mean(draws < model_mass) + 0.5 * np.mean(draws == model_mass)
+        )
+        intervals[name] = {
+            "within_68_percent": bool(summary["p16"] <= model_mass <= summary["p84"]),
+            "within_95_percent": bool(
+                summary["p2_5"] <= model_mass <= summary["p97_5"]
+            ),
+            "reference_sample_percentile": float(percentile),
+            "offset_from_median_dex": float(log_mass - summary["log10_median"]),
+        }
+    return {
+        "model_log10_M200c_Msun": log_mass,
+        "model_M200c_Msun": model_mass,
+        "interval_checks": intervals,
+        "interpretation": "Membership in an assumed reference distribution; not a formal significance.",
     }
 
 
@@ -750,12 +1138,15 @@ def liao_redshift_diagnostic(d: dict, z_used: float):
 # ------------------ Main ------------------
 def main():
     ap = argparse.ArgumentParser(
-        description="Estimate stellar mass and M200 (Astropy). Includes MC uncertainty propagation for color, M/L, luminosity, and stellar mass.",
+        description="Keep the selected model IMF; invert Chabrier stellar mass, convert native virial/peak mass to M200c, and propagate uncertainties.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    ap.add_argument("input_file", type=str, help="Galaxy data JSON/dict (without magnitudes)")
     ap.add_argument(
-        "magnitudes_file", type=str,
+        "input_file", type=str, help="Galaxy data JSON/dict (without magnitudes)"
+    )
+    ap.add_argument(
+        "magnitudes_file",
+        type=str,
         help="Combined g/r .magnitudes.json from legacy_ellipse_profile.py",
     )
 
@@ -768,6 +1159,18 @@ def main():
         help="Color–M/L relation",
     )
     ap.add_argument("--M_r_sun", type=float, default=4.64, help="Solar |M_r| (AB)")
+    ap.add_argument(
+        "--photometry_component",
+        choices=["bulge", "total"],
+        default=None,
+        help="What the supplied magnitudes measure; use 'total' for whole-galaxy photometry. Otherwise read the galaxy JSON photometry_component, falling back to 'bulge' for legacy compatibility.",
+    )
+    ap.add_argument(
+        "--gr_correlation",
+        type=float,
+        default=None,
+        help="Correlation of g/r magnitude errors, from -1 to 1; otherwise use magnitude JSON g_r_corr, or 0.",
+    )
     # Cosmology
     ap.add_argument(
         "--planck18", action="store_true", help="Use astropy.cosmology.Planck18"
@@ -781,6 +1184,11 @@ def main():
 
     # Output formatting
     ap.add_argument("--json", action="store_true", help="Print JSON payload")
+    ap.add_argument(
+        "--json_numeric",
+        action="store_true",
+        help="Print JSON with unrounded numeric values rather than formatted strings.",
+    )
 
     # SHMR + ICL prior
     ap.add_argument(
@@ -807,13 +1215,13 @@ def main():
         "--shmr_shift_dex",
         type=float,
         default=0.0,
-        help="Add shift to log10(M200) from SHMR",
+        help="Explicit shift of native log10 halo mass before conversion (UM: Mpeak; Moster: M200c); 0 gives the unshifted reference.",
     )
     ap.add_argument(
         "--um_scatter_dex",
         type=float,
         default=0.25,
-        help="1σ log10 scatter for 'umachine' (report only)",
+        help="Assumed log10 Mpeak scatter at fixed stellar mass, added in the final reference budget. This is not UM's measured stellar-mass scatter.",
     )
     ap.add_argument(
         "--c200",
@@ -831,13 +1239,31 @@ def main():
         "--target_halo_sigma",
         type=float,
         default=0,
-        help="Target percentage of CDM halo mass from SHMR inversion, -1sigma = p16 0=median +1sigma=p84",
+        help="Select a Gaussian-equivalent quantile of the combined halo reference draws: 0=median, -1~p16, +1~p84.",
     )
     ap.add_argument(
         "--target_ml_sigma",
         type=float,
         default=0,
-        help="Target percentage of median computed M/L, -1sigma = p16 0=median +1sigma=p84",
+        help="Shift the model M/L by this many M/L-systematic sigma; the photometric SHMR reference stays unshifted.",
+    )
+    ap.add_argument(
+        "--umachine_path",
+        type=str,
+        default=None,
+        help="UniverseMachine DR1 root; overrides UMACHINE_PATH.",
+    )
+    ap.add_argument(
+        "--halo_conversion_z",
+        type=float,
+        default=None,
+        help="Epoch for the Mvir-to-M200c boundary conversion, e.g. known peak-mass redshift. Default: adopted observed redshift, explicitly an equivalent-halo assumption.",
+    )
+    ap.add_argument(
+        "--compare_log_m200",
+        type=float,
+        default=None,
+        help="Check a model log10(M200c/Msun), e.g. 13.57, against each 68%% and 95%% reference interval.",
     )
     # Optional photometric / redshift uncertainties
     ap.add_argument(
@@ -914,15 +1340,27 @@ def main():
     z_phot_liao_err = as_float_or_none(d.get("z_phot_liao_err", None))
     z_source_label = d.get("z_source", z_used_desc)
 
-    target_halo_sigma = d.get("target_halo_sigma", args.target_halo_sigma)
-    target_ml_sigma = d.get("target_ml_sigma", args.target_ml_sigma)
+    target_halo_sigma = float(d.get("target_halo_sigma", args.target_halo_sigma))
+    target_ml_sigma = float(d.get("target_ml_sigma", args.target_ml_sigma))
 
-    disk_luminosity_adj = d.get("disk_luminosity_adj", args.disk_luminosity_adj)
-    bulge_luminosity_adj = d.get("bulge_luminosity_adj", args.disk_luminosity_adj)
+    disk_luminosity_adj = float(d.get("disk_luminosity_adj", args.disk_luminosity_adj))
+    bulge_luminosity_adj = float(
+        d.get("bulge_luminosity_adj", args.bulge_luminosity_adj)
+    )
+    photometry_component = (
+        args.photometry_component
+        if args.photometry_component is not None
+        else d.get("photometry_component", "bulge")
+    )
 
     g_err = pick_optional_float(args.g_err, "g_err")
     r_err = pick_optional_float(args.r_err, "r_err")
     z_err_in = choose_redshift_error_from_input(args.z_err, d, z_key_used)
+    gr_correlation = (
+        args.gr_correlation
+        if args.gr_correlation is not None
+        else float(phot.get("g_r_corr", 0.0))
+    )
 
     z_diagnostic = liao_redshift_diagnostic(d, z)
 
@@ -943,8 +1381,13 @@ def main():
     b_over_a = None if b_over_a_raw is None else float(b_over_a_raw)
     a_over_b = None if (b_over_a is None or b_over_a <= 0) else 1.0 / b_over_a
 
+    # Disk to Total ratio
     DT_raw = d.get("D/T", d.get("D_over_T", 0.0))
-    DT = float(max(0.0, min(1.0, DT_raw if DT_raw is not None else 0.0)))
+    DT = float(DT_raw if DT_raw is not None else 0.0)
+
+    # Disk to Bulge ratio
+    DB_raw = d.get("D/B", d.get("D_over_B", 0.0))
+    DB = float(DB_raw if DB_raw is not None else 0.0)
 
     if args.c200 is None:
         c_input = d.get("c", d.get("c200", None))
@@ -955,6 +1398,49 @@ def main():
                 c_input = None
     else:
         c_input = args.c200
+
+    for label, value in (
+        ("g_err", g_err),
+        ("r_err", r_err),
+        ("z_err", z_err_in),
+        ("ml_systematic_dex", ml_systematic_dex),
+        ("um_scatter_dex", args.um_scatter_dex),
+        ("c_scatter_dex", args.c_scatter_dex),
+        ("icl_frac", args.icl_frac),
+    ):
+        if value is not None and (not np.isfinite(value) or value < 0):
+            ap.error(f"{label} must be finite and nonnegative.")
+    if not np.isfinite(DT) or not 0 <= DT <= 1:
+        ap.error("D/T must lie in [0, 1].")
+    if photometry_component not in ("bulge", "total"):
+        ap.error("photometry_component must be 'bulge' or 'total'.")
+    if photometry_component == "bulge" and DT == 1:
+        ap.error(
+            "Bulge-only photometry cannot normalize a D/T=1 galaxy; use --photometry_component total."
+        )
+    if (not np.isfinite(gr_correlation)) or abs(gr_correlation) > 1:
+        ap.error("gr_correlation must lie in [-1, 1].")
+    if any(
+        not np.isfinite(x) or x <= 0
+        for x in (disk_luminosity_adj, bulge_luminosity_adj)
+    ):
+        ap.error("Disk and bulge luminosity adjustments must be finite and positive.")
+    if c_input is not None and (not np.isfinite(c_input) or c_input <= 0):
+        ap.error("c200 must be finite and positive.")
+    if args.ml_mc_samples < 100:
+        ap.error("ml_mc_samples must be at least 100.")
+    if args.halo_conversion_z is not None and (
+        not np.isfinite(args.halo_conversion_z) or args.halo_conversion_z < 0
+    ):
+        ap.error("halo_conversion_z must be finite and nonnegative.")
+    for label, value in (
+        ("target_ml_sigma", target_ml_sigma),
+        ("target_halo_sigma", target_halo_sigma),
+        ("shmr_shift_dex", args.shmr_shift_dex),
+        ("compare_log_m200", args.compare_log_m200),
+    ):
+        if value is not None and not np.isfinite(float(value)):
+            ap.error(f"{label} must be finite.")
 
     Re_bulge_arcsec = d.get("Re_bulge_arcsec", None)
 
@@ -999,6 +1485,25 @@ def main():
         ML = mlr_bell2003_diet_gr(gmr0)
         ml_name = "Bell+2003 (diet Salpeter)"
 
+    # Model and empirical SHMR comparison use explicitly separate mass scales.
+    # The supplied magnitudes may describe a bulge or the whole galaxy.
+    if photometry_component == "bulge":
+        # Bulge scaling to photometrically determined mass
+        model_bulge_scale = bulge_luminosity_adj
+        # Disk scale found from Disk/Bulge ratio
+        model_disk_scale = DB * bulge_luminosity_adj
+        # Total photometric scale
+        photometric_total_mass_scale = 1 + DB
+    else:
+        photometric_total_mass_scale = 1.0
+        model_bulge_scale = (1.0 - DT) * bulge_luminosity_adj
+        model_disk_scale = DT * disk_luminosity_adj
+    chabrier_offset_dex = 0.10 if args.ml == "bell03_diet" else 0.0
+    model_ml_scale = 10.0 ** (ml_systematic_dex * target_ml_sigma)
+    Mstar_photometric_Msun = ML * Lr_Lsun * photometric_total_mass_scale
+    Mstar_chabrier_Msun = Mstar_photometric_Msun * 10.0 ** (-chabrier_offset_dex)
+    ML_chabrier = ML * 10.0 ** (-chabrier_offset_dex)
+
     uncertainty_mc = estimate_photometric_uncertainties_mc(
         g=g,
         r=r,
@@ -1012,14 +1517,20 @@ def main():
         nsamp=args.ml_mc_samples,
         systematic_dex=ml_systematic_dex,
         seed=args.ml_mc_seed,
+        gr_correlation=gr_correlation,
+        photometric_mass_scale=photometric_total_mass_scale,
+        model_bulge_scale=model_bulge_scale,
+        model_disk_scale=model_disk_scale,
+        model_ml_scale=model_ml_scale,
+        chabrier_offset_dex=chabrier_offset_dex,
+        return_samples=True,
     )
-    ML *= 10 ** (ml_systematic_dex * target_ml_sigma)
-    Mbulge_Msun = ML * Lr_Lsun
+    photometric_samples = uncertainty_mc.pop("_samples")
+    ML *= model_ml_scale
 
     # --- Disk/Bulge split ---
-    # Assume photometry is for the bulge
-    Mdisk_Msun = Mbulge_Msun * DT / (1 - DT) * disk_luminosity_adj
-    Mbulge_Msun *= bulge_luminosity_adj
+    Mdisk_Msun = ML * Lr_Lsun * model_disk_scale
+    Mbulge_Msun = ML * Lr_Lsun * model_bulge_scale
     Mstar_Msun = Mbulge_Msun + Mdisk_Msun
     DT_init = Mdisk_Msun / Mstar_Msun
 
@@ -1047,12 +1558,127 @@ def main():
     icl_used = max(0.0, float(args.icl_frac))
 
     # ------------------ SHMR path (with icl_used) ------------------
-    Mstar_eff = Mstar_Msun * (1.0 + icl_used)
-    shmr = {"icl_used": icl_used}
+    Mstar_eff = Mstar_chabrier_Msun * (1.0 + icl_used)
+    z_conversion = z if args.halo_conversion_z is None else args.halo_conversion_z
+    params = None
+    if args.shmr_model == "umachine":
+        params_path = um_parameter_path(args.gal_type, args.umachine_path)
+        params = read_um_parameters(params_path)
+        native_reference = mpeak_um_median(Mstar_eff, z, args.gal_type, params)
+        source_cosmo = UM_COSMOLOGY
+    else:
+        native_reference = invert_shmr_moster13(Mstar_eff)
+        source_cosmo = MOSTER_COSMOLOGY
+    native_shifted = native_reference * 10.0**args.shmr_shift_dex
+    reference_m200, conversion_details = virial_to_m200c_nfw(
+        native_shifted,
+        z_conversion,
+        cosmo,
+        c_input,
+        source_cosmo=(source_cosmo if args.shmr_model == "umachine" else cosmo),
+        source_delta=(None if args.shmr_model == "umachine" else 200.0),
+    )
+    halo_uncertainty = estimate_halo_reference_mc(
+        photometric_samples,
+        cosmo,
+        args.gal_type,
+        c_input=c_input,
+        params=params,
+        shmr_model=args.shmr_model,
+        icl_fraction=icl_used,
+        halo_scatter_dex=(
+            args.um_scatter_dex if args.shmr_model == "umachine" else 0.0
+        ),
+        c_scatter_dex=args.c_scatter_dex,
+        native_shift_dex=args.shmr_shift_dex,
+        conversion_z=args.halo_conversion_z,
+        seed=args.ml_mc_seed + 1,
+        model_mass_per_chabrier_mass=Mstar_Msun / Mstar_chabrier_Msun,
+    )
+    halo_draws = halo_uncertainty.pop("_mass_draws")
+    combined_budget_name = "with_ml_systematic_and_concentration_and_halo_scatter"
+    combined_mass = halo_uncertainty["budgets"][combined_budget_name]["M200c_Msun"]
+    model_comparison = (
+        compare_model_mass(args.compare_log_m200, halo_draws)
+        if args.compare_log_m200 is not None
+        else None
+    )
+    shmr = {
+        "icl_used": icl_used,
+        "stellar_IMF_for_inversion": "Chabrier",
+        "M_star_Chabrier_for_inversion_Msun": Mstar_eff,
+        "M_star_photometric_selected_IMF_Msun": Mstar_photometric_Msun,
+        "diet_to_chabrier_offset_dex": chabrier_offset_dex,
+        "native_halo_mass_definition": (
+            "Mpeak_BryanNorman1998"
+            if args.shmr_model == "umachine"
+            else "M200c_Moster2013_z0_relation"
+        ),
+        "converted_halo_mass_definition": (
+            "M200c_spherical_NFW_equivalent"
+            if args.shmr_model == "umachine"
+            else "native_M200c_retained_no_BN_conversion"
+        ),
+        "native_unshifted_reference_Msun": native_reference,
+        "native_shifted_reference_Msun": native_shifted,
+        "native_shift_dex": args.shmr_shift_dex,
+        "M200c_reference_Msun": reference_m200,
+        "log10_M200c_reference_Msun": math.log10(reference_m200),
+        "halo_conversion_z": z_conversion,
+        "conversion_epoch_assumption": (
+            "specified_epoch"
+            if args.halo_conversion_z is not None
+            else "observed_redshift_used_as_reference_epoch"
+        ),
+        "conversion": conversion_details,
+        "native_halo_cosmology": {"H0": source_cosmo.H0.value, "Om0": source_cosmo.Om0},
+        "concentration_method": (
+            "user_c200_override" if c_input is not None else "Gu2022_eq5_z0_legacy_fit"
+        ),
+        "uncertainty_mc": halo_uncertainty,
+        "model_mass_comparison": model_comparison,
+        "interpretation": (
+            (
+                "Equivalent peak-halo reference, not a measurement of the satellite's bound model-start mass."
+                if args.gal_type == "sat"
+                else "Assumes peak virial mass approximates virial mass at the reference epoch; no mass evolution inferred."
+            )
+            if args.shmr_model == "umachine"
+            else "Native M200c from the z~0 Moster relation retained; no Bryan--Norman boundary conversion or cosmological abundance recalibration."
+        ),
+        "progenitor_adjustments_applied_to_SHMR": False,
+    }
+    if args.shmr_model == "umachine":
+        shmr["UM_parameter_file"] = params_path
+        shmr["Mpeak_reference_Msun"] = native_reference
+    analysis_warnings = []
+    missing_errors = [
+        key
+        for key, value in (("g_err", g_err), ("r_err", r_err), ("z_err", z_err_in))
+        if value is None
+    ]
+    if missing_errors:
+        analysis_warnings.append(
+            "Unspecified errors treated as zero: " + ", ".join(missing_errors)
+        )
+    if args.gal_type == "sat":
+        analysis_warnings.append(shmr["interpretation"])
+    if args.shmr_model == "umachine" and icl_used > 0:
+        analysis_warnings.append(
+            "Selected smhm_med* UM files exclude IHL; the requested added ICL changes the stellar-mass definition."
+        )
+    extrapolated = halo_uncertainty[
+        "stellar_driven_fraction_outside_log10_native_mass_10_5_to_15"
+    ]
+    if extrapolated is not None and extrapolated > 0:
+        analysis_warnings.append(
+            "Some stellar-driven halo draws extrapolate beyond the published log10 native mass fit range 10.5--15."
+        )
+    shmr["warnings"] = analysis_warnings
 
     if args.shmr_model == "moster13":
-        M200 = invert_shmr_moster13(Mstar_eff) * (10.0**args.shmr_shift_dex)
-        V200 = v200_from_m200(M200, z, cosmo).to_value(u.km / u.s)
+        M200 = reference_m200
+        V200 = v200_from_m200(M200, z_conversion, cosmo).to_value(u.km / u.s)
         shmr.update(
             {
                 "model": "Moster+2013 (z~0)",
@@ -1063,7 +1689,7 @@ def main():
                 "Mdisk_over_M200": (Mdisk_Msun / M200) if M200 > 0 else None,
             }
         )
-        hs_target = halo_structure_from_M200(M200, z, cosmo, c_input)
+        hs_target = halo_structure_from_M200(M200, z_conversion, cosmo, c_input)
         shmr["halo_structure"] = hs_target
         shmr["a_bulge_kpc"] = a_bulge_kpc
         shmr["a_bulge_over_a_halo"] = (
@@ -1073,44 +1699,59 @@ def main():
         )
 
     else:
-        med = m200_um_median(Mstar_eff, z, args.gal_type) * (10.0**args.shmr_shift_dex)
+        med = reference_m200
         scatter = max(0.0, args.um_scatter_dex)
-        p16, p84 = med * (10.0**-scatter), med * (10.0**scatter)
-        target_p = med * 10 ** (scatter * target_halo_sigma)
+        p16, p84 = combined_mass["p16"], combined_mass["p84"]
+        ratio_interval = halo_uncertainty["budgets"][combined_budget_name][
+            "Mstar_model_over_M200c"
+        ]
+        target_quantile = 0.5 * (1.0 + math.erf(target_halo_sigma / math.sqrt(2.0)))
+        target_p = float(
+            np.percentile(halo_draws[combined_budget_name], 100 * target_quantile)
+        )
 
         shmr.update(
             {
-                "model": "UM/lensing (z~0)",
+                "model": "UniverseMachine DR1 (Chabrier -> Mpeak -> M200c equivalent)",
+                "M200c_median_Msun": med,
                 "target_halo_sigma": target_halo_sigma,
                 "scatter_dex": scatter,
                 "M200c_target_Msun": target_p,
                 "M200c_p16_Msun": p16,
                 "M200c_p84_Msun": p84,
-                "V200_target_kms": v200_from_m200(target_p, z, cosmo).to_value(
+                "V200_target_kms": v200_from_m200(
+                    target_p, z_conversion, cosmo
+                ).to_value(u.km / u.s),
+                "V200_p16_kms": v200_from_m200(p16, z_conversion, cosmo).to_value(
                     u.km / u.s
                 ),
-                "V200_p16_kms": v200_from_m200(p16, z, cosmo).to_value(u.km / u.s),
-                "V200_p84_kms": v200_from_m200(p84, z, cosmo).to_value(u.km / u.s),
+                "V200_p84_kms": v200_from_m200(p84, z_conversion, cosmo).to_value(
+                    u.km / u.s
+                ),
                 "Mstar_over_M200_target": (
                     (Mstar_Msun / target_p) if target_p > 0 else None
                 ),
-                "Mstar_over_M200_p16": ((Mstar_Msun / p16) if p16 > 0 else None),
-                "Mstar_over_M200_p84": ((Mstar_Msun / p84) if p84 > 0 else None),
+                "Mstar_over_M200_p16": ratio_interval["p16"],
+                "Mstar_over_M200_p84": ratio_interval["p84"],
                 "Mbulge_over_M200_target": (
                     (Mbulge_Msun / target_p) if target_p > 0 else None
                 ),
-                "Mbulge_over_M200_p16": (Mbulge_Msun / p16) if p16 > 0 else None,
-                "Mbulge_over_M200_p84": (Mbulge_Msun / p84) if p84 > 0 else None,
+                "Mbulge_over_M200_p16": ratio_interval["p16"]
+                * Mbulge_Msun
+                / Mstar_Msun,
+                "Mbulge_over_M200_p84": ratio_interval["p84"]
+                * Mbulge_Msun
+                / Mstar_Msun,
                 "Mdisk_over_M200_target": (
                     (Mdisk_Msun / target_p) if target_p > 0 else None
                 ),
-                "Mdisk_over_M200_p16": (Mdisk_Msun / p16) if p16 > 0 else None,
-                "Mdisk_over_M200_p84": (Mdisk_Msun / p84) if p84 > 0 else None,
+                "Mdisk_over_M200_p16": ratio_interval["p16"] * Mdisk_Msun / Mstar_Msun,
+                "Mdisk_over_M200_p84": ratio_interval["p84"] * Mdisk_Msun / Mstar_Msun,
             }
         )
-        hs_target = halo_structure_from_M200(target_p, z, cosmo, c_input)
-        hs_p16 = halo_structure_from_M200(p16, z, cosmo, c_input)
-        hs_p84 = halo_structure_from_M200(p84, z, cosmo, c_input)
+        hs_target = halo_structure_from_M200(target_p, z_conversion, cosmo, c_input)
+        hs_p16 = halo_structure_from_M200(p16, z_conversion, cosmo, c_input)
+        hs_p84 = halo_structure_from_M200(p84, z_conversion, cosmo, c_input)
         shmr["halo_structure_target"] = hs_target
         shmr["halo_structure_p16"] = hs_p16
         shmr["halo_structure_p84"] = hs_p84
@@ -1136,6 +1777,7 @@ def main():
     )
 
     out = {
+        "schema_version": "2.0_IMF_and_halo_definition_corrected",
         "inputs": {
             "ra": ra,
             "dec": dec,
@@ -1153,6 +1795,8 @@ def main():
             "r": r,
             "g_err": g_err,
             "r_err": r_err,
+            "g_r_error_correlation": gr_correlation,
+            "photometry_component": photometry_component,
             "magnitudes_file": args.magnitudes_file,
             "z_err": z_err_in,
             "dereddened": True,
@@ -1207,6 +1851,11 @@ def main():
             "M_disk_Msun": Mdisk_Msun,
             "M_star_Msun": Mstar_Msun,
             "ML_method": ml_name,
+            "model_IMF": ("diet_Salpeter" if args.ml == "bell03_diet" else "Chabrier"),
+            "M_star_photometric_selected_IMF_Msun": Mstar_photometric_Msun,
+            "M_star_photometric_Chabrier_Msun": Mstar_chabrier_Msun,
+            "M_over_L_r_Chabrier_for_SHMR": ML_chabrier,
+            "SHMR_stellar_mass_note": "Present-day photometric total; no model M/L target shift or progenitor luminosity adjustments.",
             "D_over_T": DT,
             "M_bulge_Msun": Mbulge_Msun,
             "M_disk_Msun": Mdisk_Msun,
@@ -1219,10 +1868,11 @@ def main():
     s3 = sig3_noexp_str
     s5 = mag5_noexp_str
 
-    if args.json:
-        out_fmt = copy.deepcopy(out)
-        format_numbers_inplace(out_fmt)
-        print(json.dumps(out_fmt, indent=2))
+    if args.json or args.json_numeric:
+        out_fmt = finite_json_values(copy.deepcopy(out))
+        if not args.json_numeric:
+            format_numbers_inplace(out_fmt)
+        print(json.dumps(out_fmt, indent=2, allow_nan=False))
     else:
         print("\n=== Inputs ===")
         print(f"z = {s3(z)} [{z_key_used}], g = {s5(g)}, r = {s5(r)}  (dereddened)")
@@ -1264,6 +1914,12 @@ def main():
         print("\n=== Stellar mass (luminous) & bulge/disk split ===")
         print(f"M/L_r ({ml_name}) = {s3(ML)}")
         print(f"M_star = {sci3(Mstar_Msun)} Msun")
+        print(f"Photometry describes: {photometry_component}")
+        print(f"Photometric total (selected IMF) = {sci3(Mstar_photometric_Msun)} Msun")
+        print(
+            f"Chabrier-equivalent total for SHMR = {sci3(Mstar_chabrier_Msun)} Msun "
+            f"(log10={math.log10(Mstar_chabrier_Msun):.5f}; IMF offset={chabrier_offset_dex:.3f} dex)"
+        )
         print(
             f"  M_bulge = {sci3(Mbulge_Msun)} Msun,  M_disk = {sci3(Mdisk_Msun)} Msun"
         )
@@ -1322,6 +1978,21 @@ def main():
         print("\n=== Halo mass from SHMR ===")
         s = out["halo_mass_SHMR"]
         print(f"ICL fraction used for SHMR = {s3(s['icl_used'])}")
+        native_name = "Mpeak" if args.shmr_model == "umachine" else "M200c"
+        print(
+            f"Native {native_name} reference = {sci3(native_reference)} Msun "
+            f"(log10={math.log10(native_reference):.5f})"
+        )
+        print(
+            f"M200c reference = {sci3(reference_m200)} Msun "
+            f"(log10={math.log10(reference_m200):.5f}; conversion z={z_conversion:.6f})"
+        )
+        print(
+            f"Native virial overdensity = {conversion_details['Delta_vir_critical_native']:.3f} rho_crit(native cosmology); "
+            f"M200c/native_mass={conversion_details['M200c_over_Mvir']:.5f}"
+        )
+        for message in analysis_warnings:
+            print(f"NOTE: {message}")
 
         if s["model"].startswith("Moster"):
             print(
@@ -1364,6 +2035,35 @@ def main():
             if np.isfinite(a_bulge_kpc):
                 print(
                     f"  a_bulge/a_halo (target) = {s3(s['a_bulge_over_a_halo_target'])}"
+                )
+        print("\nHalo reference intervals in log10(M200c/Msun):")
+        budget_labels = {
+            "photometric_only": "Photometry + redshift only",
+            "with_ml_systematic": "+ M/L systematic",
+            "with_ml_systematic_and_concentration": "+ concentration scatter",
+            "with_ml_systematic_and_concentration_and_halo_scatter": "+ assumed halo scatter",
+        }
+        for key, label in budget_labels.items():
+            summary = halo_uncertainty["budgets"][key]["M200c_Msun"]
+            print(
+                f"  {label}: {summary['log10_median']:.5f} "
+                f"(-{summary['log10_err_minus']:.5f}, +{summary['log10_err_plus']:.5f}); "
+                f"68% [{summary['log10_p16']:.5f}, {summary['log10_p84']:.5f}]; "
+                f"95% [{summary['log10_p2_5']:.5f}, {summary['log10_p97_5']:.5f}]"
+            )
+        if args.shmr_model == "umachine":
+            print(
+                f"  Halo scatter is an assumed {args.um_scatter_dex:.3f}-dex prior in native halo mass at fixed stellar mass."
+            )
+        print("  These are reference intervals, not a Bayesian halo-mass posterior.")
+        if model_comparison is not None:
+            print(f"\nModel comparison: log10(M200c/Msun)={args.compare_log_m200:.5f}")
+            for key, label in budget_labels.items():
+                check = model_comparison["interval_checks"][key]
+                print(
+                    f"  {label}: inside 68% = {check['within_68_percent']}; "
+                    f"inside 95% = {check['within_95_percent']}; "
+                    f"reference percentile = {check['reference_sample_percentile']:.2f}%"
                 )
         print()
 
