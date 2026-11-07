@@ -9,6 +9,7 @@ A saved plot also produces matching PDF and PNG files. PDF curves and text
 remain vector graphics; PNG output defaults to 600 dpi. Residuals retain the
 original matched-fractional-arc-length definition, with spline A as reference.
 The single-column figure has a 5:8 aspect ratio, matching a 1000 x 1600 image.
+The bottom margin leaves clear space for an externally added panel annotation.
 """
 
 import argparse
@@ -450,14 +451,14 @@ def publication_plot_style():
         "font.family": "serif",
         "font.serif": ["STIXGeneral", "DejaVu Serif"],
         "mathtext.fontset": "stix",
-        "font.size": 9.0,
-        "axes.labelsize": 10.0,
-        "axes.titlesize": 10.0,
+        "font.size": 10.0,
+        "axes.labelsize": 14.0,
+        "axes.titlesize": 12.0,
         "axes.linewidth": 0.8,
         "axes.grid": False,
         "axes.unicode_minus": True,
-        "xtick.labelsize": 8.5,
-        "ytick.labelsize": 8.5,
+        "xtick.labelsize": 12.0,
+        "ytick.labelsize": 12.0,
         "xtick.direction": "in",
         "ytick.direction": "in",
         "xtick.top": True,
@@ -511,8 +512,7 @@ def save_publication_plot(fig, outpath, dpi=600):
 
     for target, fmt in targets:
         target.parent.mkdir(parents=True, exist_ok=True)
-        # Keep the chosen physical figure size; explicit margins below ensure
-        # labels fit without bbox_inches='tight' changing the export dimensions.
+        # Preserve the physical figure size after fitting the layout to the labels.
         fig.savefig(target, format=fmt, dpi=dpi, bbox_inches=None)
         print(f"Saved plot to: {target}")
     return [target for target, _ in targets]
@@ -547,11 +547,6 @@ def maybe_plot(
         fig, (ax1, ax2) = plt.subplots(
             2, 1, figsize=sizes[plot_size], sharex=True,
         )
-        fig.subplots_adjust(
-            left=0.21 if plot_size == "single" else 0.12,
-            right=0.97, bottom=0.12, top=0.92 if title else 0.97,
-            hspace=0.08,
-        )
 
         # Colors are accompanied by different line styles and explicit labels.
         ax1.plot(s_disp, cross_disp, color="#0072B2", linestyle="-", zorder=3)
@@ -564,9 +559,9 @@ def maybe_plot(
         ax2.set_ylim(bottom=0.0)
         ax2.set_xlim(float(s_disp[0]), float(s_disp[-1]))
 
-        for ax, label, description in (
-            (ax1, "(a)", "Cross-track offset"),
-            (ax2, "(b)", "Point separation"),
+        for ax, description in (
+            (ax1, "Cross-track offset"),
+            (ax2, "Point separation"),
         ):
             ax.xaxis.set_major_locator(MaxNLocator(nbins=5, min_n_ticks=3))
             ax.yaxis.set_major_locator(MaxNLocator(nbins=5, min_n_ticks=3))
@@ -574,13 +569,7 @@ def maybe_plot(
             ax.yaxis.set_minor_locator(AutoMinorLocator(2))
             ax.tick_params(which="both", direction="in", top=True, right=True)
             ax.margins(y=0.12)
-            ax.text(
-                0.035, 0.95, label + "  " + description,
-                transform=ax.transAxes, ha="left", va="top", fontsize=8.5,
-                bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.9,
-                      "pad": 1.5},
-                zorder=4,
-            )
+            ax.set_title(description, loc="left", pad=4)
 
         if show_stats:
             cross_rms = rmse(cross_disp, np.zeros_like(cross_disp))
@@ -597,9 +586,11 @@ def maybe_plot(
                       "pad": 1.5},
             )
         if title:
-            fig.suptitle(title, fontsize=10)
+            fig.suptitle(title, fontsize=13)
 
         try:
+            # Reserve the bottom 10% for the existing external "(c)" annotation.
+            fig.tight_layout(pad=0.45, h_pad=0.50, rect=(0.0, 0.10, 1.0, 1.0))
             if outpath:
                 return save_publication_plot(fig, outpath, dpi=dpi)
             plt.show()
