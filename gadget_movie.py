@@ -94,14 +94,17 @@ def _snapshot_time_myr(h5f, time_unit_myr=None) -> float:
             )
         for attrs in attr_sources:
             if not all(
-                key in attrs
-                for key in ("UnitLength_in_cm", "UnitVelocity_in_cm_per_s")
+                key in attrs for key in ("UnitLength_in_cm", "UnitVelocity_in_cm_per_s")
             ):
                 continue
             unit_length = float(np.asarray(attrs["UnitLength_in_cm"]).item())
             unit_velocity = float(np.asarray(attrs["UnitVelocity_in_cm_per_s"]).item())
-            if not all(math.isfinite(v) and v > 0 for v in (unit_length, unit_velocity)):
-                raise ValueError("Snapshot length and velocity units must be finite and positive.")
+            if not all(
+                math.isfinite(v) and v > 0 for v in (unit_length, unit_velocity)
+            ):
+                raise ValueError(
+                    "Snapshot length and velocity units must be finite and positive."
+                )
             seconds_per_myr = 365.25 * 86400.0 * 1.0e6  # Julian-year definition
             time_unit_myr = unit_length / unit_velocity / seconds_per_myr
             break
@@ -1959,54 +1962,54 @@ def gadget_hdf5_movie(
         bar_len_px = SCALE_BAR_KPC * px_per_kpc
 
         # Stable upper-left anchoring in display pixels.
-        margin_left = 70.0
-        margin_top = 55.0
-        tick_half_len = 10.0
-        label_offset = 4.0
+        # margin_left = 70.0
+        # margin_top = 70.0
+        # tick_half_len = 10.0
+        # label_offset = 4.0
 
-        x0 = margin_left
-        x1 = x0 + bar_len_px
-        y0 = float(win_h) - margin_top
+        # x0 = margin_left
+        # x1 = x0 + bar_len_px
+        # y0 = float(win_h) - margin_top
 
         # If the bar becomes wider than the available window, clamp its
         # right endpoint while preserving the upper-left anchor.
-        if x1 > float(win_w) - 20.0:
-            x1 = float(win_w) - 20.0
+        # if x1 > float(win_w) - 20.0:
+        #    x1 = float(win_w) - 20.0
 
-        displayed_bar_len_px = x1 - x0
-
-        geom = (
-            round(x0, 2),
-            round(x1, 2),
-            round(y0, 2),
-            round(displayed_bar_len_px, 2),
-            int(win_w),
-            int(win_h),
-        )
-
-        # Stable lower-right anchoring in display pixels.
-        # margin_right = 70.0
-        # margin_bottom = 55.0
-        # tick_half_len = 10.0
-        # label_offset = 4.0  # closer to the bar vertically
-
-        # x1 = float(win_w) - margin_right
-        # x0 = x1 - bar_len_px
-        # y0 = margin_bottom
-
-        # If the bar becomes wider than the window, clamp it.
-        # if x0 < 20.0:
-        #    x0 = 20.0
-        #    x1 = x0 + bar_len_px
+        # displayed_bar_len_px = x1 - x0
 
         # geom = (
         #    round(x0, 2),
         #    round(x1, 2),
         #    round(y0, 2),
-        #    round(bar_len_px, 2),
+        #    round(displayed_bar_len_px, 2),
         #    int(win_w),
         #    int(win_h),
         # )
+
+        # Stable lower-right anchoring in display pixels.
+        margin_right = 70.0
+        margin_bottom = 70.0
+        tick_half_len = 10.0
+        label_offset = 4.0  # closer to the bar vertically
+
+        x1 = float(win_w) - margin_right
+        x0 = x1 - bar_len_px
+        y0 = margin_bottom
+
+        # If the bar becomes wider than the window, clamp it.
+        if x0 < 20.0:
+            x0 = 20.0
+            x1 = x0 + bar_len_px
+
+        geom = (
+            round(x0, 2),
+            round(x1, 2),
+            round(y0, 2),
+            round(bar_len_px, 2),
+            int(win_w),
+            int(win_h),
+        )
         if (not force) and (_scale_bar_last == geom):
             return
         _scale_bar_last = geom
@@ -2040,7 +2043,7 @@ def gadget_hdf5_movie(
             scale_bar_label_actor.SetInput(f"{int(SCALE_BAR_KPC)} kpc")
 
             tp = scale_bar_label_actor.GetTextProperty()
-            tp.SetFontSize(24)
+            tp.SetFontSize(48)
             tp.SetColor(0.0, 0.0, 0.0)
             tp.BoldOn()
             tp.SetJustificationToCentered()
