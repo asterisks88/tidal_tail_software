@@ -1,3 +1,11 @@
+ARCHIVE AVAILABILITY
+-----------------------------------------------------------
+The full research archive is available from the author upon request.
+It includes all FITS files, region files, camera files, and the GALIC,
+AGAMA, and GADGET-4 initial-condition (IC) files used in this study.
+The archive contains the supporting inputs referenced by the pipeline
+commands below.
+
 
 LEGACY IMAGE
 -----------------------------------------------------------
