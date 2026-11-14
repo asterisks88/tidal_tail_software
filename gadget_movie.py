@@ -513,6 +513,111 @@ def _galaxy_index_from_pid(
     return gid
 
 
+def _snapshot_length_unit_kpc(h5f, length_unit_kpc=None) -> float:
+    """Physical kpc per coordinate unit for this noncomoving viewer."""
+    if length_unit_kpc is None:
+        for name in ("Parameters", "Header"):
+            if name in h5f and "UnitLength_in_cm" in h5f[name].attrs:
+                length_unit_kpc = (
+                    float(h5f[name].attrs["UnitLength_in_cm"]) / u.kpc.to(u.cm)
+                )
+                break
+        else:
+            raise ValueError(
+                "Cannot convert galaxy separation to kpc: snapshot has no "
+                "UnitLength_in_cm. Supply --length-unit-kpc (e.g. 1 for "
+                "coordinates already in kpc)."
+            )
+    length_unit_kpc = float(length_unit_kpc)
+    if not math.isfinite(length_unit_kpc) or length_unit_kpc <= 0:
+        raise ValueError("The length unit in kpc must be finite and positive.")
+    return length_unit_kpc
+
+
+def _stellar_core_center(coords, masses):
+    """Mass-weighted shrinking-sphere center, excluding extended tidal debris.
+
+    Start at the coordinate median and shrink the radius by 20% per step,
+    retaining at least 1% of the stars (or 32 particles for small samples).
+    Return None when no finite, positive-mass stellar particles remain.
+    """
+    valid = np.all(np.isfinite(coords), axis=1) & np.isfinite(masses) & (masses > 0)
+    coords, masses = coords[valid], masses[valid]
+    if coords.shape[0] == 0:
+        return None
+    target = min(coords.shape[0], max(32, int(math.ceil(0.01 * coords.shape[0]))))
+    center = np.median(coords, axis=0)
+    radius = float(np.max(np.linalg.norm(coords - center, axis=1)))
+    for _ in range(100):
+        if coords.shape[0] <= target or radius == 0:
+            break
+        radius *= 0.8
+        keep = np.linalg.norm(coords - center, axis=1) <= radius
+        if np.count_nonzero(keep) < target:
+            break
+        coords, masses = coords[keep], masses[keep]
+        center = np.average(coords, axis=0, weights=masses)
+    return np.average(coords, axis=0, weights=masses)
+
+
+def _galaxy_separation_kpc(
+    h5f, id_starts, id_ends, host_gid, sat_gid, length_unit_kpc=None
+) -> float:
+    """True 3D separation of the two stellar cores, independent of camera/FOV.
+
+    Use all disk, bulge and stellar particles, irrespective of plotted families.
+    ParticleID ranges identify their original galaxy even after stripping.
+    Use snapshot particle masses or MassTable; old files without either use
+    equal particle weights. A missing stellar component yields NaN (N/A).
+    """
+    unit_kpc = _snapshot_length_unit_kpc(h5f, length_unit_kpc)
+    coords_by_galaxy = [[], []]
+    masses_by_galaxy = [[], []]
+    for part_idx in (2, 3, 4):
+        group = h5f.get(f"PartType{part_idx}")
+        if (
+            group is None
+            or "Coordinates" not in group
+            or group["Coordinates"].shape[0] == 0
+        ):
+            continue
+        if "ParticleIDs" not in group:
+            raise ValueError(
+                f"PartType{part_idx} is missing ParticleIDs; cannot identify "
+                "host/satellite centers for --show-separation."
+            )
+        coords = np.asarray(group["Coordinates"][()], dtype=np.float64)
+        pids = np.asarray(group["ParticleIDs"][()], dtype=np.int64)
+        if "Masses" in group:
+            masses = np.asarray(group["Masses"][()], dtype=np.float64)
+        elif "Mass" in group:
+            masses = np.asarray(group["Mass"][()], dtype=np.float64)
+        else:
+            mass_table = h5f["Header"].attrs.get("MassTable", np.zeros(6))
+            mass = float(mass_table[part_idx])
+            masses = np.full(coords.shape[0], mass if mass > 0 else 1.0)
+        for index, gid in enumerate((host_gid, sat_gid)):
+            keep = (pids >= id_starts[gid]) & (pids <= id_ends[gid])
+            if np.any(keep):
+                coords_by_galaxy[index].append(coords[keep])
+                masses_by_galaxy[index].append(masses[keep])
+    centers = []
+    for coords, masses in zip(coords_by_galaxy, masses_by_galaxy):
+        if not coords:
+            return math.nan
+        center = _stellar_core_center(np.concatenate(coords), np.concatenate(masses))
+        if center is None:
+            return math.nan
+        centers.append(center)
+    return float(np.linalg.norm(centers[1] - centers[0]) * unit_kpc)
+
+
+def _separation_label(distance_kpc) -> str:
+    if not math.isfinite(distance_kpc):
+        return "3D separation: N/A"
+    return f"3D separation: {distance_kpc:.2f} kpc"
+
+
 def _counts_from_masses(
     masses: np.ndarray, ml: np.ndarray, zp: float, redshift: float, cosmo
 ) -> np.ndarray:
@@ -1623,6 +1728,8 @@ def gadget_hdf5_movie(
     debug_photometry=False,
     synthetic_component="both",
     time_unit_myr=None,
+    show_separation=False,
+    length_unit_kpc=None,
 ):
     global paused, running, update_frame, current_frame, start_frame, end_frame, frame_step
     frame_step = max(1, int(step_size))
@@ -1809,6 +1916,11 @@ def gadget_hdf5_movie(
         host_gid = int(np.where(gal_order == 0)[0][0])
         sat_gid = int(np.where(gal_order == 1)[0][0])
 
+        if show_separation:
+            separation_kpc0 = _galaxy_separation_kpc(
+                f0, id_starts, id_ends, host_gid, sat_gid, length_unit_kpc
+            )
+
         clouds = {}
         actors = {}
 
@@ -1839,6 +1951,23 @@ def gadget_hdf5_movie(
         color="blue",
         name="frame_text",
     )
+
+    separation_actor = None
+    if show_separation:
+        separation_actor = p.add_text(
+            _separation_label(separation_kpc0),
+            position=(20, int(p.window_size[1]) - 20),
+            font_size=24,
+            color="blue",
+            name="separation_text",
+        )
+        separation_actor.GetTextProperty().SetVerticalJustificationToTop()
+
+        def _position_separation_label(*_args):
+            # Match the timestamp's 20-pixel margin, including after resizing.
+            separation_actor.SetPosition(20, max(20, int(p.window_size[1]) - 20))
+
+        p.renderer.AddObserver("StartEvent", _position_separation_label)
 
     iren = p.iren.interactor
     ruler, rep = make_ruler_widget(iren)
@@ -2861,6 +2990,11 @@ def gadget_hdf5_movie(
                 if coords is None:
                     coords = np.empty((0, 3), dtype=np.float64)
                 clouds[key].points = coords
+            if separation_actor is not None:
+                separation_kpc = _galaxy_separation_kpc(
+                    f, id_starts, id_ends, host_gid, sat_gid, length_unit_kpc
+                )
+                separation_actor.SetInput(_separation_label(separation_kpc))
         try:
             text_actor.SetInput(f"Frame: {frame_num} Time: {time_myr:.3f} Myr")
         except Exception:
@@ -2957,6 +3091,25 @@ def main():
             "Explicit Myr per internal time unit for noncomoving snapshots. "
             "Default: derive from the snapshot's Parameters (or Header) unit "
             "attributes. Use this override for older files without unit metadata."
+        ),
+    )
+    parser.add_argument(
+        "--show-separation",
+        action="store_true",
+        help=(
+            "Display the true 3D host-satellite stellar-core separation in kpc "
+            "in the upper left, updated each frame (also in MP4 output). "
+            "Centers use a mass-weighted shrinking sphere on disk/bulge/stars."
+        ),
+    )
+    parser.add_argument(
+        "--length-unit-kpc",
+        type=float,
+        default=None,
+        help=(
+            "Kpc per snapshot coordinate unit for --show-separation. Default: "
+            "derive from UnitLength_in_cm in Parameters or Header. Supply 1 "
+            "for old snapshots already in kpc but lacking unit metadata."
         ),
     )
     parser.add_argument(
@@ -3276,6 +3429,8 @@ def main():
         debug_photometry=bool(args.debug_photometry),
         synthetic_component=args.synthetic_component,
         time_unit_myr=args.time_unit_myr,
+        show_separation=args.show_separation,
+        length_unit_kpc=args.length_unit_kpc,
     )
 
 
